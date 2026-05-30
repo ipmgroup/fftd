@@ -1,0 +1,87 @@
+# ICEZero (TE0876-03-A) Pin Constraints
+# Lattice ICE40HX4K-TQ144
+
+# ── 100 MHz Oscillator ──────────────────────────────
+set_io  clk      35    # 100 MHz on-board oscillator
+
+# ── User LEDs ────────────────────────────────────────
+set_io  led[0]   120   # XTRA_A_0 — LED1 (red)
+set_io  led[1]   117   # XTRA_A_3 — LED2 (green)
+set_io  led[2]   121   # XTRA_A_1 — LED3 (blue)
+
+# ── Push Button ──────────────────────────────────────
+set_io  btn      116   # XTRA_A_2 — user button
+
+# ── SPI0 (Mesa Bus — Pi ↔ FPGA) ─────────────────────
+set_io  spi_mosi  90   # P11-19  GPIO10  PI_SPI_MOSI
+set_io  spi_miso  87   # P11-21  GPIO9   PI_SPI_MISO
+set_io  spi_sck   79   # P11-23  GPIO11  PI_SPI_SCK
+set_io  spi_ce0   85   # P11-24  GPIO8   PI_SPI_CE_0
+set_io  spi_ce1   78   # P11-26  GPIO7   PI_SPI_CE_1
+
+# ── FPGA Configuration (from Pi) ─────────────────────
+set_io  cfg_done   65   # P11-29  GPIO5
+set_io  cfg_si     68   # P11-31  GPIO6
+set_io  cfg_ss     71   # P11-32  GPIO12
+set_io  cfg_so     67   # P11-33  GPIO13
+set_io  cfg_sck    70   # P11-36  GPIO16
+set_io  cfg_rst    66   # P11-37  GPIO26
+
+# ── I²C ──────────────────────────────────────────────
+set_io  i2c_sda   115   # P11-3   GPIO2
+set_io  i2c_scl   114   # P11-5   GPIO3
+
+# ── UART (debug console) ─────────────────────────────
+set_io  uart_txd  113   # P11-8   GPIO14
+set_io  uart_rxd  112   # P11-10  GPIO15
+
+# ── GPIO (Pi ↔ FPGA) ─────────────────────────────────
+set_io  gpio_0     88   # P11-22  GPIO25
+set_io  gpio_1     99   # P11-18  GPIO24
+set_io  gpio_2    101   # P11-15  GPIO22
+
+# ── PMOD A (P1) ──────────────────────────────────────
+set_io  pmod_a[0] 141
+set_io  pmod_a[1] 139
+set_io  pmod_a[2] 138
+set_io  pmod_a[3] 137
+set_io  pmod_a[4] 136
+set_io  pmod_a[5] 135
+set_io  pmod_a[6] 134
+set_io  pmod_a[7] 130
+
+# ── PMOD B (P2) ──────────────────────────────────────
+set_io  pmod_b[0]  55
+set_io  pmod_b[1]  56
+set_io  pmod_b[2]  47
+set_io  pmod_b[3]  48
+set_io  pmod_b[4]  44
+set_io  pmod_b[5]  45
+set_io  pmod_b[6]  42
+set_io  pmod_b[7]  43
+
+# ── PMOD C (P3) ──────────────────────────────────────
+set_io  pmod_c[0]  41
+set_io  pmod_c[1]  26
+set_io  pmod_c[2]  39
+set_io  pmod_c[3]  29
+set_io  pmod_c[4]  38
+set_io  pmod_c[5]  28
+set_io  pmod_c[6]  37
+set_io  pmod_c[7]  52
+
+# ── PMOD D (P4) ──────────────────────────────────────
+set_io  pmod_d[0]   1
+set_io  pmod_d[1]  21
+set_io  pmod_d[2] 144
+set_io  pmod_d[3]  20
+set_io  pmod_d[4] 143
+set_io  pmod_d[5]   8
+set_io  pmod_d[6] 142
+set_io  pmod_d[7]   7
+
+# ── FTDI Pin Header (J3) ─────────────────────────────
+set_io  ftdi_wo   119   # J3-2
+set_io  ftdi_wi   122   # J3-4
+set_io  ftdi_ro   124   # J3-5
+set_io  ftdi_ri   125   # J3-6

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pdf
+*.xlsx
+.git/
+build/
+hardware/synth/build/
+*.bin
+*.asc
+*.json
+*.blif

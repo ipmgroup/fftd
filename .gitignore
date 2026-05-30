@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.xlsx
+*.pdf
+
+# Build artifacts
+build/
+*.bin
+*.asc
+*.json
+*.blif
+*.vvp
+*.vcd
+*.ko
+*.so
+*.o
+
+# Docker
+.docker/
+

@@ -1,0 +1,17 @@
+name: Cross-Compile ARM
+
+on: [push, pull_request]
+
+jobs:
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+      - name: Build libfft.so (ARM)
+        run: make -C software/lib ARM_CROSS=arm-linux-gnueabihf-
+      - name: Build kernel driver (ARM)
+        run: make -C software/kernel_driver ARM_CROSS=arm-linux-gnueabihf-

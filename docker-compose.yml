@@ -1,0 +1,67 @@
+# Docker Compose — ICE40-FFT Development Environment
+#
+# Usage:
+#   docker compose build           # build the image
+#   docker compose run --rm dev     # interactive shell
+#   docker compose run --rm make    # run make <target>
+#   docker compose run --rm synth   # synthesize FPGA
+#   docker compose run --rm blinky  # build blinky test
+#   docker compose run --rm test    # run simulations
+
+services:
+  dev:
+    build: .
+    image: ice40-fft:latest
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+
+  make:
+    extends: dev
+    entrypoint: ["make"]
+    stdin_open: false
+    tty: false
+
+  synth:
+    extends: dev
+    entrypoint: ["make", "-C", "hardware/synth", "synth_ice40"]
+    stdin_open: false
+    tty: false
+
+  blinky:
+    extends: dev
+    entrypoint: ["make", "-C", "examples/blinky"]
+    stdin_open: false
+    tty: false
+
+  sim:
+    extends: dev
+    entrypoint: ["make", "-C", "hardware/sim"]
+    stdin_open: false
+    tty: false
+
+  arm-lib:
+    extends: dev
+    entrypoint: ["make", "-C", "software/lib", "ARM_CROSS=arm-linux-gnueabihf-"]
+    stdin_open: false
+    tty: false
+
+  arm-driver:
+    extends: dev
+    entrypoint: ["make", "-C", "software/kernel_driver", "ARM_CROSS=arm-linux-gnueabihf-"]
+    stdin_open: false
+    tty: false
+
+  test:
+    extends: dev
+    entrypoint: ["python3", "-m", "pytest", "tests/", "-v"]
+    stdin_open: false
+    tty: false
+
+  setup:
+    extends: dev
+    entrypoint: ["./scripts/setup_dev.sh"]
+    stdin_open: false
+    tty: false
