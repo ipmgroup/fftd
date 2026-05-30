@@ -20,8 +20,8 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 ### Docker (recommended — no local toolchain needed)
 
 ```bash
-git clone https://github.com/your-org/ice40-fft.git
-cd ice40-fft
+git clone https://github.com/ipmgroup/fftd.git
+cd fftd
 
 # Build Docker image & run blinky test
 make docker-build
@@ -41,7 +41,7 @@ make docker-shell
 make all
 
 # 4. Deploy to Raspberry Pi + ICEZero
-echo "raspberry-pi.local" > .config/pi_address.txt
+echo "rpia5" > .config/pi_address.txt
 ./scripts/deploy_to_pi.sh
 
 # 5. Run integration tests

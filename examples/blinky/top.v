@@ -1,29 +1,34 @@
 //===========================================================================
-// Blinky — Test project for ICEZero (ICE40HX4K-TQ144)
-// Adapted from cliffordwolf/icotools examples/blinky
+// Blinky — Running LED (ping-pong) for ICEZero (ICE40HX4K-TQ144)
 //
-// LEDs: FPGA pins 120 (red), 117 (green), 121 (blue) — XTRA header J1
-// Clock: 100 MHz on-board oscillator on pin 35
+// LEDs: FPGA pins 110 (red), 93 (green), 94 (blue) — on-board user LEDs
+// Clock: 100 MHz on-board oscillator on pin 49 (GBIN6)
+//
+// Pattern: red → green → blue → green → red → ...  (~6 steps/sec)
 //===========================================================================
 
 module top (
-    input  clk,            // 100 MHz (pin 35)
-    output led1,           // Red   — FPGA pin 120
-    output led2,           // Green — FPGA pin 117
-    output led3            // Blue  — FPGA pin 121
+    input  clk,            // 100 MHz (pin 49, GBIN6)
+    output led1,           // Red   — FPGA pin 110
+    output led2,           // Green — FPGA pin 93
+    output led3            // Blue  — FPGA pin 94
 );
 
-    // ── 26-bit Counter ─────────────────────────────
-    // 100 MHz / 2^26 ≈ 1.49 Hz toggle on bit 25
+    // ── Counter: each LED step lasts 2^24 clocks = ~168 ms @ 100 MHz ──
     reg [25:0] counter = 0;
 
-    always @(posedge clk) begin
+    always @(posedge clk)
         counter <= counter + 1;
-    end
 
-    // ── LED Drivers (different blink patterns) ──────
-    assign led1 = counter[25];                     // ~0.75 Hz
-    assign led2 = counter[24];                     // ~1.49 Hz
-    assign led3 = counter[25] ^ counter[24];       // alternating pattern
+    // ── 4-state ping-pong using top 2 bits ─────────
+    // 00 → led1 (red)
+    // 01 → led2 (green)
+    // 10 → led3 (blue)
+    // 11 → led2 (green)  ← reverse
+    wire [1:0] state = counter[25:24];
+
+    assign led1 = (state == 2'b00);
+    assign led2 = (state == 2'b01) || (state == 2'b11);
+    assign led3 = (state == 2'b10);
 
 endmodule

@@ -658,7 +658,7 @@ gcc --version           # >= 9.0
 ## 7. Структура репозитория
 
 ```
-ice40-fft-project/
+ice40-fft/
 ├── README.md                    # Главная документация
 ├── LICENSE                      # MIT/BSD license
 ├── Makefile                     # Top-level makefile
@@ -1069,14 +1069,14 @@ ICEZero использует непересекающийся набор пин�
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/your-org/ice40-fft-project.git
-cd ice40-fft-project
+git clone https://github.com/ipmgroup/fftd.git
+cd fftd
 
 # 2. Setup development environment
 ./scripts/setup_dev.sh
 
 # 3. Configure Raspberry Pi address
-echo "raspberry-pi.local" > .config/pi_address.txt
+echo "rpia5" > .config/pi_address.txt
 echo "pi" > .config/pi_user.txt
 ```
 
@@ -1127,7 +1127,7 @@ make -C software/lib ARM_CROSS=arm-linux-gnueabihf- clean all && \
 ./scripts/remote_shell.sh
 
 # Или use sshfs для mount Pi directories
-sshfs pi@raspberry-pi:/home/pi ~/mnt/pi
+sshfs pi@rpia5:/home/pi ~/mnt/pi
 # Теперь можно editing файлы локально, сохранение синхронизируется
 ```
 
@@ -1260,7 +1260,7 @@ FPGA_PACKAGE := tq144
 FPGA_SPEED := 5
 
 # Remote Pi
-PI_ADDR ?= $(shell cat .config/pi_address.txt 2>/dev/null || echo "raspberry-pi.local")
+PI_ADDR ?= $(shell cat .config/pi_address.txt 2>/dev/null || echo "rpia5")
 PI_USER ?= $(shell cat .config/pi_user.txt 2>/dev/null || echo "pi")
 PI_HOST := $(PI_USER)@$(PI_ADDR)
 REMOTE_DIR := /tmp/ice40-fft

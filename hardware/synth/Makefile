@@ -21,8 +21,7 @@ $(BUILD_DIR)/$(TOP).json: $(wildcard $(RTL_DIR)/*.v)
 # ── Step 2: Place & Route (nextpnr) ──────────────────
 $(BUILD_DIR)/$(TOP).asc: $(BUILD_DIR)/$(TOP).json $(PCF) $(SDC)
 	$(NEXTPNR) --$(FPGA_DEVICE) --package $(FPGA_PACKAGE) \
-		--speed $(FPGA_SPEED) --json $< --pcf $(PCF) --asc $@ \
-		--freq 50
+		--json $< --pcf $(PCF) --asc $@ --freq 50
 
 # ── Step 3: Bitstream (icepack) ──────────────────────
 $(BUILD_DIR)/$(TOP).bin: $(BUILD_DIR)/$(TOP).asc

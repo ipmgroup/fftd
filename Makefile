@@ -1,5 +1,5 @@
 # ICE40-FFT Project — Top-Level Makefile
-# https://github.com/your-org/ice40-fft
+# https://github.com/ipmgroup/fftd
 
 include config.mk
 

@@ -1,10 +1,11 @@
 # Blinky — Pin constraints for ICEZero (TE0876-03-A)
 # Lattice ICE40HX4K-TQ144
+# Reference: cliffordwolf/icotools examples/icezero/icezero.pcf
 
-# 100 MHz on-board oscillator
-set_io  clk   35
+# 100 MHz on-board oscillator (GBIN6, global clock buffer 6)
+set_io  clk   49
 
-# User LEDs (XTRA header J1)
-set_io  led1  120   # XTRA_A_0 — red
-set_io  led2  117   # XTRA_A_3 — green
-set_io  led3  121   # XTRA_A_1 — blue
+# On-board user LEDs
+set_io  led1  110   # LED1 (red)
+set_io  led2   93   # LED2 (green)
+set_io  led3   94   # LED3 (blue)

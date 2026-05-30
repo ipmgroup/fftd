@@ -1,0 +1,248 @@
+/*
+ *  icezprog — FPGA Programming Tool for ICEZero (TE0876-03, REV02)
+ *
+ *  Adapted from cliffordwolf/icotools examples/icezero/icezprog.c
+ *  Original by Kevin M. Hubbard (blackmesalabs/ice_zero_prog)
+ *
+ *  GPIO pin mapping for TE0876-03 REV02 (from Trenz pinout.xlsx):
+ *    CFG_DONE  = GPIO5  (P11-29)
+ *    CFG_SI    = GPIO6  (P11-31)
+ *    CFG_SS    = GPIO12 (P11-32)
+ *    CFG_SO    = GPIO13 (P11-33)
+ *    CFG_SCK   = GPIO16 (P11-36)
+ *    CFG_RST   = GPIO26 (P11-37)
+ *
+ *  Build:  gcc -o icezprog icezprog.c -llgpio
+ *  Usage:  ./icezprog design.bin    — program FPGA SRAM
+ *          ./icezprog .             — program FPGA Flash (first sector)
+ *          ./icezprog ..            — reset & boot from Flash
+ *
+ *  Requires lgpio (sudo apt install liblgpio-dev).
+ *  Auto-detects gpiochip4 (Pi5) or gpiochip0 (Pi4 and earlier).
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <lgpio.h>
+
+// ── ICEZero REV02 Pin Definitions (BCM GPIO numbers) ──
+#define CFG_SS   12  // P11-32, GPIO12
+#define CFG_SCK  16  // P11-36, GPIO16
+#define CFG_SI    6  // P11-31, GPIO6
+#define CFG_SO   13  // P11-33, GPIO13
+#define CFG_RST  26  // P11-37, GPIO26
+#define CFG_DONE  5  // P11-29, GPIO5
+
+// ── lgpio handle (set in main) ──────────────────────
+static int gh = -1;
+
+// ── GPIO helpers ────────────────────────────────────
+static inline void gpio_write(int pin, int val) { lgGpioWrite(gh, pin, val); }
+static inline int  gpio_read(int pin)            { return lgGpioRead(gh, pin); }
+
+// ── SPI bit-bang helpers ────────────────────────────
+static void spi_begin(void) { gpio_write(CFG_SS, 0); }
+static void spi_end(void)   { gpio_write(CFG_SS, 1); }
+
+static uint32_t spi_xfer(uint32_t data, int nbits) {
+    uint32_t rdata = 0;
+    for (int i = nbits-1; i >= 0; i--) {
+        gpio_write(CFG_SI, (data >> i) & 1);
+        gpio_write(CFG_SCK, 1);
+        if (gpio_read(CFG_SO)) rdata |= (1 << i);
+        gpio_write(CFG_SCK, 0);
+    }
+    return rdata;
+}
+
+// ── FPGA Reset ──────────────────────────────────────
+// Toggles CRESET_B. SS_B state at CRESET release determines config mode:
+//   SS_B LOW  → SPI slave (SRAM programming)
+//   SS_B HIGH → SPI master boot from flash
+static void fpga_reset(void) {
+    gpio_write(CFG_RST, 0);
+    usleep(2000);
+    gpio_write(CFG_RST, 1);
+    usleep(2000);   // tRP: wait for FPGA internal init (1.2 ms min)
+}
+
+// ── Program SRAM ────────────────────────────────────
+static void prog_sram(FILE *f) {
+    printf("Programming FPGA SRAM...\n");
+
+    // ICE40 SPI slave config: SS_B must be LOW before releasing CRESET_B
+    // so the FPGA enters SPI slave config mode instead of booting from flash.
+    gpio_write(CFG_SS, 0);
+    fpga_reset();
+    // CDONE is LOW here — FPGA is waiting for bitstream data (expected)
+
+    // 8 dummy clocks with SS asserted
+    for (int i = 0; i < 8; i++) {
+        gpio_write(CFG_SCK, 0);
+        gpio_write(CFG_SCK, 1);
+    }
+
+    // Send bitstream
+    int byte_cnt = 0;
+    for (;;) {
+        int byte = getc(f);
+        if (byte == EOF) break;
+        for (int i = 7; i >= 0; i--) {
+            gpio_write(CFG_SI, (byte >> i) & 1);
+            gpio_write(CFG_SCK, 0);
+            gpio_write(CFG_SCK, 1);
+        }
+        byte_cnt++;
+    }
+
+    // 49 dummy clocks — CDONE should go HIGH during these if config succeeded
+    for (int i = 0; i < 49; i++) {
+        gpio_write(CFG_SCK, 0);
+        gpio_write(CFG_SCK, 1);
+    }
+
+    gpio_write(CFG_SS, 1);
+    usleep(2000);
+    if (gpio_read(CFG_DONE))
+        printf("✅ FPGA programmed successfully (%d bytes)\n", byte_cnt);
+    else
+        fprintf(stderr, "⚠️  CDONE is low — programming may have failed\n");
+}
+
+// ── Flash Helpers ───────────────────────────────────
+static void flash_power_up(void) {
+    spi_begin();
+    spi_xfer(0xAB, 8);  // release from deep power-down
+    spi_end();
+    usleep(100);
+}
+
+static void flash_read_id(void) {
+    spi_begin();
+    spi_xfer(0x9F, 8);
+    uint8_t mfg = spi_xfer(0, 8);
+    uint8_t mem = spi_xfer(0, 8);
+    uint8_t cap = spi_xfer(0, 8);
+    spi_end();
+    printf("Flash ID: %02X %02X %02X\n", mfg, mem, cap);
+}
+
+static void flash_write_enable(void) {
+    spi_begin();
+    spi_xfer(0x06, 8);
+    spi_end();
+}
+
+static void flash_wait_busy(void) {
+    spi_begin();
+    spi_xfer(0x05, 8);
+    while (spi_xfer(0, 8) & 1) { usleep(1000); }
+    spi_end();
+}
+
+static void flash_erase_sector(uint32_t addr) {
+    flash_write_enable();
+    spi_begin();
+    spi_xfer(0x20, 8);
+    spi_xfer(addr >> 16, 8);
+    spi_xfer(addr >> 8, 8);
+    spi_xfer(addr, 8);
+    spi_end();
+    flash_wait_busy();
+}
+
+static void flash_program_page(uint32_t addr, uint8_t *data, int len) {
+    flash_write_enable();
+    spi_begin();
+    spi_xfer(0x02, 8);
+    spi_xfer(addr >> 16, 8);
+    spi_xfer(addr >> 8, 8);
+    spi_xfer(addr, 8);
+    for (int i = 0; i < len; i++)
+        spi_xfer(data[i], 8);
+    spi_end();
+    flash_wait_busy();
+}
+
+// ── Program Flash ───────────────────────────────────
+// CRESET_B is held LOW by main() before this is called,
+// so the FPGA is in reset and the SPI flash bus is accessible.
+static void prog_flash(FILE *f) {
+    printf("Erasing Flash sector 0...\n");
+    flash_power_up();
+    flash_read_id();
+    flash_erase_sector(0);
+
+    printf("Programming Flash...\n");
+    uint8_t buf[256];
+    int total = 0;
+    for (int page = 0;; page++) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0) break;
+        flash_program_page(page * 256, buf, n);
+        total += n;
+        if (total % 4096 == 0) printf("  %d bytes...\n", total);
+    }
+    printf("✅ Flash programmed (%d bytes)\n", total);
+}
+
+// ── Boot from Flash ─────────────────────────────────
+// SS_B must be HIGH when CRESET_B is released so FPGA boots as SPI master.
+static void boot_from_flash(void) {
+    printf("Booting FPGA from Flash...\n");
+    gpio_write(CFG_SS, 1);
+    gpio_write(CFG_RST, 0);
+    usleep(2000);
+    gpio_write(CFG_RST, 1);
+    usleep(500000);
+    if (gpio_read(CFG_DONE))
+        printf("✅ FPGA booted from Flash\n");
+    else
+        fprintf(stderr, "⚠️  CDONE is low\n");
+}
+
+// ── Main ────────────────────────────────────────────
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <bitstream.bin>   — program FPGA SRAM\n", argv[0]);
+        fprintf(stderr, "       %s .                  — erase Flash & program\n", argv[0]);
+        fprintf(stderr, "       %s ..                 — reset & boot from Flash\n", argv[0]);
+        return 1;
+    }
+
+    // Auto-detect gpiochip: Pi5 uses chip 4, Pi4 and earlier use chip 0
+    struct stat st;
+    int chip = (stat("/dev/gpiochip4", &st) == 0) ? 4 : 0;
+    gh = lgGpiochipOpen(chip);
+    if (gh < 0) {
+        fprintf(stderr, "Error: cannot open /dev/gpiochip%d: %s\n", chip, lguErrorText(gh));
+        return 1;
+    }
+
+    lgGpioClaimOutput(gh, 0, CFG_SS,  1);   // SS idle HIGH
+    lgGpioClaimOutput(gh, 0, CFG_SCK, 0);
+    lgGpioClaimOutput(gh, 0, CFG_SI,  0);
+    lgGpioClaimInput (gh, 0, CFG_SO);
+    lgGpioClaimOutput(gh, 0, CFG_RST, 0);   // hold FPGA in reset
+    lgGpioClaimInput (gh, 0, CFG_DONE);
+
+    if (strcmp(argv[1], "..") == 0) {
+        boot_from_flash();
+    } else if (strcmp(argv[1], ".") == 0) {
+        prog_flash(stdin);
+        boot_from_flash();
+    } else {
+        FILE *f = fopen(argv[1], "rb");
+        if (!f) { perror(argv[1]); lgGpiochipClose(gh); return 1; }
+        prog_sram(f);
+        fclose(f);
+    }
+
+    lgGpiochipClose(gh);
+    return 0;
+}

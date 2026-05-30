@@ -18,7 +18,7 @@ FPGA_PACKAGE := tq144
 FPGA_SPEED   := 5
 
 # Remote Raspberry Pi (SSH)
-PI_ADDR      ?= $(shell cat .config/pi_address.txt 2>/dev/null || echo raspberry-pi.local)
+PI_ADDR      ?= $(shell cat .config/pi_address.txt 2>/dev/null || echo rpia5)
 PI_USER      ?= $(shell cat .config/pi_user.txt 2>/dev/null || echo pi)
 PI_HOST      := $(PI_USER)@$(PI_ADDR)
 REMOTE_DIR   := /tmp/ice40-fft

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-PI_ADDR=$(cat .config/pi_address.txt 2>/dev/null || echo "raspberry-pi.local")
+PI_ADDR=$(cat .config/pi_address.txt 2>/dev/null || echo "rpia5")
 PI_USER=$(cat .config/pi_user.txt 2>/dev/null || echo "pi")
 PI_HOST="${PI_USER}@${PI_ADDR}"
 REMOTE_DIR="/tmp/ice40-fft"
