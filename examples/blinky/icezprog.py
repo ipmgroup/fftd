@@ -113,14 +113,18 @@ class IceZeroProg:
         GPIO.output(CFG_SS, GPIO.HIGH)
 
     def spi_xfer(self, data, nbits=8):
-        """Bit-bang SPI transfer, returns received data."""
+        """Bit-bang SPI transfer with timing delays (matching original icotools)."""
         result = 0
         for i in range(nbits - 1, -1, -1):
             GPIO.output(CFG_SI, (data >> i) & 1)
-            GPIO.output(CFG_SCK, GPIO.HIGH)
+            time.sleep(0.00001)  # 10us delay like original uwait_barrier_sync
             if GPIO.input(CFG_SO):
                 result |= (1 << i)
+            time.sleep(0.00001)
+            GPIO.output(CFG_SCK, GPIO.HIGH)
+            time.sleep(0.00001)
             GPIO.output(CFG_SCK, GPIO.LOW)
+            time.sleep(0.00001)
         return result
 
     def fpga_reset(self):
@@ -173,7 +177,7 @@ class IceZeroProg:
         self.spi_begin()
         self.spi_xfer(0xAB)
         self.spi_end()
-        time.sleep(0.001)
+        time.sleep(0.01)
 
     def flash_read_id(self):
         """Read SPI Flash manufacturer/device ID."""
@@ -188,20 +192,17 @@ class IceZeroProg:
         print(f"Flash: MFG=0x{mfg:02X} DEV=0x{dev:02X} SIZE={size_mb} MB")
 
     def flash_erase(self):
-        """Bulk erase SPI Flash."""
+        """Bulk erase SPI Flash (0xC7) with fixed wait."""
         self.flash_power_up()
         self.spi_begin()
-        # Write enable
-        self.spi_xfer(0x06)
+        self.spi_xfer(0x06)  # Write enable
         self.spi_end()
-        # Bulk erase
         self.spi_begin()
-        self.spi_xfer(0xC7)
+        self.spi_xfer(0xC7)  # Bulk erase
         self.spi_end()
-        # Wait for completion
         print("Erasing Flash...")
-        time.sleep(10)
-        print("✅ Erase complete")
+        time.sleep(15)
+        print("Erase complete")
 
     def flash_program(self, bitfile):
         """Program bitstream to QSPI Flash."""
@@ -212,22 +213,20 @@ class IceZeroProg:
 
         for addr in range(0, len(data), 256):
             chunk = data[addr:addr + 256]
-            # Write enable
             self.spi_begin()
-            self.spi_xfer(0x06)
+            self.spi_xfer(0x06)  # Write enable
             self.spi_end()
-            # Page program
             self.spi_begin()
-            self.spi_xfer(0x02)
+            self.spi_xfer(0x02)  # Page program
             self.spi_xfer((addr >> 16) & 0xFF)
             self.spi_xfer((addr >> 8) & 0xFF)
             self.spi_xfer(addr & 0xFF)
             for b in chunk:
                 self.spi_xfer(b)
             self.spi_end()
-            time.sleep(0.003)  # tPP = 3ms max
+            time.sleep(0.01)
 
-        print(f"✅ Flash programmed ({len(data)} bytes)")
+        print(f"Flash programmed ({len(data)} bytes)")
 
     def boot_flash(self):
         """Reset FPGA to boot from Flash."""
