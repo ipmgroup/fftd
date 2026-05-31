@@ -6,7 +6,7 @@ Hardware-accelerated Fast Fourier Transform on Lattice ICE40HX4K FPGA with Linux
 
 This project provides an end-to-end DSP pipeline: from Verilog RTL running on an ICEZero board to a Linux `libfft.so` library with Python bindings — all built with the fully open-source Project IceStorm toolchain.
 
-- **FPGA**: Lattice ICE40HX4K (7680 LC, 32 × 4 kbit BRAM)
+- **FPGA**: Lattice ICE40HX4K (3520 LUT4, 32 × 4 kbit BRAM)
 - **Board**: Trenz Electronic ICEZero (Raspberry Pi HAT form-factor)
 - **FFT size**: 1024-point Radix-2 DIT (configurable via parameter)
 - **Data width**: 16-bit Q1.15 fixed-point (real-only output via SPI)
@@ -110,7 +110,7 @@ Benchmark comparing FPGA (ICE40HX4K, 50 MHz, 16-bit Q1.15) vs CPU (Raspberry Pi 
 | numpy.fft float32 | 26 µs | 72× | NEON-optimized, 32-bit float |
 | **FFTW3** float32 | **3.1 µs** | **603×** | C API, `FFTW_MEASURE`, native march |
 
-**FPGA resources**: 1960/7680 LC (25%), 28/32 BRAM (87%), Fmax 71.8 MHz @ 50 MHz.
+**FPGA resources**: 1960/7680 LC — 25% (ICE40HX4K: 3520 LUT4 + 3520 FF), 28/32 BRAM (87%), Fmax 71.8 MHz @ 50 MHz.
 
 **Why CPU is faster for N=1024**:
 - 2.4 GHz vs 50 MHz = 48× clock advantage
