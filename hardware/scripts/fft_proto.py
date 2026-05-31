@@ -10,7 +10,7 @@ import time
 import numpy as np
 
 N = 1024
-SPI_SPEED = 1000000  # Hz (start at 1 MHz, Pi max ~32 MHz, safe at 50 MHz sysclk)
+SPI_SPEED = 8000000  # Hz — tested stable at 50 MHz sysclk (6.25× oversampling)
 
 # ── Protocol constants ──────────────────────────
 CMD_STATUS_REQ  = 0x60
