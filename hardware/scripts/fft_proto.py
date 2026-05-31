@@ -10,7 +10,7 @@ import time
 import numpy as np
 
 N = 1024
-SPI_SPEED = 10000000  # Hz — max reliable at 50 MHz sysclk (5× oversampling)
+SPI_SPEED = 8000000  # Hz — tested stable at 50 MHz sysclk (6.25× oversampling)
 
 # ── Protocol constants ──────────────────────────
 CMD_STATUS_REQ  = 0x60
