@@ -1,13 +1,13 @@
 # SRAM Test Makefile
 
-include ../../../config.mk
+include ../../config.mk
 
 TOP       := sram_test
 BUILD_DIR := build
 PCF       := sram_test.pcf
-RTL       := sram_test.v sram_ctrl_simple.v ../../rtl/spi_slave_proto.v
+RTL       := sram_test.v sram_ctrl_simple.v ../../hardware/rtl/spi_slave_proto.v
 
-.PHONY: synth prog clean
+.PHONY: synth clean
 
 synth: $(BUILD_DIR)/$(TOP).bin
 
@@ -17,13 +17,10 @@ $(BUILD_DIR)/$(TOP).json: $(RTL)
 
 $(BUILD_DIR)/$(TOP).asc: $(BUILD_DIR)/$(TOP).json $(PCF)
 	$(NEXTPNR) --hx4k --package $(FPGA_PACKAGE) \
-		--json $< --pcf $(PCF) --asc $@ --freq 50
+		--json $< --pcf $(PCF) --asc $@ --freq 25
 
 $(BUILD_DIR)/$(TOP).bin: $(BUILD_DIR)/$(TOP).asc
 	$(ICEPACK) $< $@
-
-prog: $(BUILD_DIR)/$(TOP).bin
-	sudo python3 ../../../examples/blinky/icezprog.py $<
 
 clean:
 	rm -rf $(BUILD_DIR)

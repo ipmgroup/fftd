@@ -29,17 +29,16 @@ module sram_test (
     output wire         sram_ub_n
 );
 
-    // ── PLL: 100 MHz → 16 MHz ─────────────────────
+    // ── PLL: 100 MHz → 25 MHz ─────────────────────
     // DIVR=0 (÷1), DIVF=7 (×8), DIVQ=5 (÷32) → 25 MHz
-    // For 16 MHz: DIVR=4 (÷5), DIVF=7 (×8), DIVQ=3 (÷8) → 20 MHz
-    // Try DIVR=0, DIVF=7, DIVQ=5 → 100×8/32 = 25 MHz first
+    // Fvco=800 MHz (in range 533-1066 ✓)
     wire clk;
 
     SB_PLL40_PAD #(
         .FEEDBACK_PATH("SIMPLE"),
         .DIVR(4'b0000),
         .DIVF(7'b0000111),
-        .DIVQ(3'b100),          // ÷16 → 50 MHz
+        .DIVQ(3'b101),          // ÷32 → 25 MHz
         .FILTER_RANGE(3'b001)
     ) pll_inst (
         .PACKAGEPIN    (clk_100mhz),
@@ -47,6 +46,10 @@ module sram_test (
         .RESETB        (1'b1),
         .BYPASS        (1'b0)
     );
+
+    // Secondary divider: 12.5 MHz → use DIVQ=3 (÷8) → 25 MHz
+    // Actually use DIVR=0, DIVF=7, DIVQ=5 → 25 MHz ÷ div chain
+    // Let us just use DIVR=0, DIVF=7, DIVQ=6 → 100*8/64 = 12.5 MHz
 
     // ── Reset ──────────────────────────────────────
     reg [7:0] rst_cnt = 0;
@@ -193,7 +196,7 @@ module sram_test (
     generate
         for (gi = 0; gi < 16; gi = gi + 1) begin : sram_dio
             SB_IO #(
-                .PIN_TYPE(6'b1010_01),
+                .PIN_TYPE(6'b1010_01),  // icotools: input reg, enable reg
                 .PULLUP(1'b0)
             ) dio (
                 .PACKAGE_PIN(sram_dq[gi]),

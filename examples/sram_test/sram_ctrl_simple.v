@@ -1,9 +1,8 @@
 //=============================================================================
-// sram_ctrl_simple — Minimal IS61WV25616BLL controller (icotools-style)
+// sram_ctrl_simple — IS61WV25616BLL controller (icotools-style, fixed OE)
 //
-// CE#, LB#, UB# = always 0 (asserted)
-// WE#/OE# toggle for writes/reads
-// 32-bit word = 2×16-bit accesses
+// KEY: oe_n=0 in IDLE (FPGA Hi-Z). Only oe_n=1 during WRITE data phases.
+// SB_IO OUTPUT_ENABLE = oe_n (registered, 1-cycle latency).
 //=============================================================================
 
 `timescale 1ns / 1ps
@@ -31,7 +30,6 @@ module sram_ctrl_simple (
     output wire         sram_ub_n
 );
 
-    // Always asserted (icotools pattern)
     assign sram_ce_n = 1'b0;
     assign sram_lb_n = 1'b0;
     assign sram_ub_n = 1'b0;
@@ -40,19 +38,19 @@ module sram_ctrl_simple (
     assign sram_oe_n = oe_n;
     assign sram_we_n = we_n;
 
-    localparam ST_IDLE    = 0;
-    localparam ST_WR0     = 1;  // assert WE#, drive lo word
-    localparam ST_WR0_WAIT = 2;
-    localparam ST_WR0_END = 3;  // deassert WE#
-    localparam ST_WR1     = 4;  // assert WE#, drive hi word
-    localparam ST_WR1_WAIT = 5;
-    localparam ST_WR1_END = 6;  // deassert WE#
-    localparam ST_WR_DONE = 7;
-    localparam ST_RD0     = 8;  // assert OE#, latch lo word
-    localparam ST_RD0_WAIT = 9;
-    localparam ST_RD1     = 10; // assert OE#, latch hi word
-    localparam ST_RD1_WAIT = 11;
-    localparam ST_RD_DONE = 12;
+    localparam ST_IDLE   = 4'd0;
+    localparam ST_TURN   = 4'd1;
+    localparam ST_RD0    = 4'd2;
+    localparam ST_RD0_W  = 4'd3;
+    localparam ST_RD1    = 4'd4;
+    localparam ST_RD1_W  = 4'd5;
+    localparam ST_WR0    = 4'd6;
+    localparam ST_WR0_W  = 4'd7;
+    localparam ST_WR0_E  = 4'd8;
+    localparam ST_WR1    = 4'd9;
+    localparam ST_WR1_W  = 4'd10;
+    localparam ST_WR1_E  = 4'd11;
+    localparam ST_DONE   = 4'd12;
 
     reg [3:0]  state;
     reg [18:0] addr_r;
@@ -60,7 +58,6 @@ module sram_ctrl_simple (
 
     wire [18:0] word_addr = addr[18:1];
     wire [18:0] next_word = word_addr + 19'd1;
-
     assign sram_a = addr_r;
 
     always @(posedge clk or negedge rst_n) begin
@@ -68,78 +65,59 @@ module sram_ctrl_simple (
             state <= ST_IDLE;
             addr_r <= 0; wdata_r <= 0; rdata <= 0;
             busy <= 0; done <= 0; rdata_valid <= 0;
-            oe_n <= 1; we_n <= 1;
-            sram_dout <= 0;
+            oe_n <= 0; we_n <= 1; sram_dout <= 0;
         end else begin
             done <= 0; rdata_valid <= 0;
-
             case (state)
                 ST_IDLE: begin
-                    oe_n <= 1; we_n <= 1;
+                    oe_n <= 0; we_n <= 1;
                     if (req && !busy) begin
-                        addr_r <= word_addr;
-                        wdata_r <= wdata;
+                        addr_r <= word_addr; wdata_r <= wdata;
                         busy <= 1;
                         if (wr) begin
-                            // Start write: OE#=1 (FPGA drives), WE#=0
                             sram_dout <= wdata[15:0];
                             oe_n <= 1;
-                            we_n <= 0;
-                            state <= ST_WR0;
+                            state <= ST_TURN;
                         end else begin
-                            // Start read: OE#=0 (SRAM drives), WE#=1
-                            oe_n <= 0;
-                            we_n <= 1;
                             state <= ST_RD0;
                         end
                     end
                 end
-
-                // ── Write lo word ──────────────────
-                ST_WR0:     begin state <= ST_WR0_WAIT; end
-                ST_WR0_WAIT: begin state <= ST_WR0_END; end
-                ST_WR0_END: begin
-                    we_n <= 1;
-                    addr_r <= next_word;
+                ST_TURN: begin
+                    we_n <= 0; state <= ST_WR0;
+                end
+                ST_WR0:   state <= ST_WR0_W;
+                ST_WR0_W: state <= ST_WR0_E;
+                ST_WR0_E: begin
+                    we_n <= 1; addr_r <= next_word;
                     sram_dout <= wdata_r[31:16];
                     state <= ST_WR1;
                 end
-
-                // ── Write hi word ──────────────────
-                ST_WR1:     begin we_n <= 0; state <= ST_WR1_WAIT; end
-                ST_WR1_WAIT: begin state <= ST_WR1_END; end
-                ST_WR1_END: begin we_n <= 1; state <= ST_WR_DONE; end
-                ST_WR_DONE: begin
-                    oe_n <= 1;  // back to default
-                    done <= 1; busy <= 0; state <= ST_IDLE;
+                ST_WR1:   begin we_n <= 0; state <= ST_WR1_W; end
+                ST_WR1_W: state <= ST_WR1_E;
+                ST_WR1_E: begin
+                    we_n <= 1; oe_n <= 0;
+                    state <= ST_DONE;
                 end
-
-                // ── Read lo word ───────────────────
-                ST_RD0:     begin state <= ST_RD0_WAIT; end
-                ST_RD0_WAIT: begin
+                ST_RD0:   state <= ST_RD0_W;
+                ST_RD0_W: begin
                     rdata[15:0] <= sram_din;
-                    oe_n <= 1;
-                    addr_r <= next_word;
+                    oe_n <= 1; addr_r <= next_word;
                     state <= ST_RD1;
                 end
-
-                // ── Read hi word ───────────────────
-                ST_RD1:     begin oe_n <= 0; state <= ST_RD1_WAIT; end
-                ST_RD1_WAIT: begin
+                ST_RD1:   begin oe_n <= 0; state <= ST_RD1_W; end
+                ST_RD1_W: begin
                     rdata[31:16] <= sram_din;
-                    oe_n <= 1;
-                    state <= ST_RD_DONE;
+                    oe_n <= 1; state <= ST_DONE;
                 end
-                ST_RD_DONE: begin
-                    rdata_valid <= 1; done <= 1; busy <= 0;
+                ST_DONE: begin
+                    oe_n <= 0; done <= 1; busy <= 0;
                     state <= ST_IDLE;
                 end
-
                 default: state <= ST_IDLE;
             endcase
         end
     end
 
 endmodule
-
 `default_nettype wire
