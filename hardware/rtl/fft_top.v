@@ -398,6 +398,26 @@ module fft_top (
         (sram_rd_byte_cnt == 2'd2) ? sram_rdata_r[15:8]  :
                                      sram_rdata_r[7:0];
 
+    // ── SB_IO for SRAM data bus (per icotools example) ──
+    wire [15:0] sram_din;        // data FROM SRAM (registered by SB_IO)
+    wire [15:0] sram_dout;       // data TO SRAM
+    wire        sram_oe_n;       // SRAM OE# — also used as SB_IO OUTPUT_ENABLE
+
+    genvar gi;
+    generate
+        for (gi = 0; gi < 16; gi = gi + 1) begin : sram_dio
+            SB_IO #(
+                .PIN_TYPE(6'b1010_01),  // input registered, output no reg, enable registered
+                .PULLUP(1'b0)
+            ) dio (
+                .PACKAGE_PIN(sram_dq[gi]),
+                .OUTPUT_ENABLE(sram_oe_n),    // same signal as SRAM OE#!
+                .D_OUT_0(sram_dout[gi]),
+                .D_IN_0(sram_din[gi])
+            );
+        end
+    endgenerate
+
     sram_ctrl sram (
         .clk        (clk),
         .rst_n      (rst_n),
@@ -410,7 +430,8 @@ module fft_top (
         .done       (sram_done),
         .rdata_valid(sram_rvalid),
         .sram_a     (sram_a),
-        .sram_dq    (sram_dq),
+        .sram_din   (sram_din),
+        .sram_dout  (sram_dout),
         .sram_ce_n  (sram_ce_n),
         .sram_oe_n  (sram_oe_n),
         .sram_we_n  (sram_we_n),
