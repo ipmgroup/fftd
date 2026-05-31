@@ -42,7 +42,7 @@
 - **Плата**: Trenz Electronic ICEZero (TE0876-03-A)
 - **FPGA**: Lattice ICE40HX4K-TQ144 (3520 LUT4, 80 kbits Block RAM, 40 nm)
 - **Память**: 
-  - 4 Mbit external SRAM (AS6C4008-55PCN, 512 kBytes)
+  - 4 Mbit external SRAM (IS61WV25616BLL-10TLI, 256K×16, 10 ns, 512 kBytes)
   - 8 MByte QSPI Flash (для bitstream)
   - 2 kbit EEPROM
 - **GPIO**: 
