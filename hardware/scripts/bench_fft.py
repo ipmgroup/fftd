@@ -12,7 +12,7 @@ print("="*60)
 print("FPGA FFT (ICE40HX4K, 50 MHz, SPI 8 MHz, poll_ms=1)")
 print("="*60)
 
-proto=FftProto(speed=8000000)
+proto=FftProto()  # uses default from fft_proto (12 MHz)
 f,_=proto.status()
 print(f"  Status: {f}")
 if f['busy']: proto.wait_done(timeout=5.0, poll_ms=1)
