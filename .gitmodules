@@ -1,0 +1,3 @@
+[submodule "third_party/sdft"]
+	path = third_party/sdft
+	url = https://github.com/kelu124/fpga-fft.git

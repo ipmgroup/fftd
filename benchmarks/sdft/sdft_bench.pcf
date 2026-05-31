@@ -1,0 +1,5 @@
+# SDFT Benchmark — ICE40HX4K TQ144 pin constraints
+set_io  clk_100mhz   49
+set_io  led1        110
+set_io  led2         93
+set_io  led3         94
