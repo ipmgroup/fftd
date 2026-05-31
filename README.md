@@ -10,8 +10,8 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 - **Board**: Trenz Electronic ICEZero (Raspberry Pi HAT form-factor)
 - **FFT size**: 1024-point Radix-2 DIT (configurable via parameter)
 - **Data width**: 16-bit Q1.15 fixed-point (real-only output via SPI)
-- **Throughput**: 547 000 bins/s (1024-point FFT + SPI readout @ 8 MHz)
-- **Latency**: ~1.1 ms compute + 3.8 ms SPI transfer (1024-point)
+- **Throughput**: 170 000 bins/s (6.04 ms total per 1024-point FFT)
+- **Latency**: 2.26 ms compute + 3.77 ms SPI transfer (1024-point, 8 MHz SCK)
 - **SPI Protocol**: XOR checksum framing, 8 MHz SCK
 
 ## Quick Start
@@ -104,11 +104,11 @@ Benchmark comparing FPGA (ICE40HX4K, 50 MHz, 16-bit Q1.15) vs CPU (Raspberry Pi 
 
 | Method | Time/FFT | vs FPGA | Notes |
 |--------|----------|---------|-------|
-| **FPGA** ICE40HX4K | **1870 µs** | 1× | 50 MHz, Radix-2 DIT, 16-bit Q1.15 |
-| FPGA compute only | ~1100 µs | — | Excluding SPI readout (3.8 ms) |
-| numpy.fft float64 | 27 µs | 69× | NEON-optimized, 64-bit float |
-| numpy.fft float32 | 26 µs | 72× | NEON-optimized, 32-bit float |
-| **FFTW3** float32 | **3.1 µs** | **603×** | C API, `FFTW_MEASURE`, native march |
+| **FPGA** ICE40HX4K | **6.04 ms** | 1× | 2.26 ms compute + 3.77 ms SPI readout |
+| FPGA compute only | 2.26 ms | — | 50 MHz, Radix-2 DIT, poll_ms=1 |
+| numpy.fft float64 | 25 µs | 237× | NEON-optimized, 64-bit float |
+| numpy.fft float32 | 25 µs | 242× | NEON-optimized, 32-bit float |
+| **FFTW3** float32 | **6.6 µs** | **916×** | C API, `-O3 -march=native` |
 
 **FPGA resources**: 1960/7680 LC — 25% (ICE40HX4K: 3520 LUT4 + 3520 FF), 28/32 BRAM (87%), Fmax 71.8 MHz @ 50 MHz.
 
