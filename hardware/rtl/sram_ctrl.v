@@ -139,10 +139,10 @@ module sram_ctrl (
                 // ── READ LO (lower 16 bits) ────────
                 ST_RD_LO: begin
                     cyc_cnt <= cyc_cnt + 1;
-                    if (cyc_cnt == 2) begin
+                    if (cyc_cnt == 3) begin
                         rdata[15:0] <= sram_dq;
                     end
-                    if (cyc_cnt == 3) begin
+                    if (cyc_cnt == 4) begin
                         cyc_cnt <= 0;
                         ce_n <= 1; oe_n <= 1;
                         state  <= ST_RD_HI;
@@ -156,10 +156,10 @@ module sram_ctrl (
                         ce_n <= 0; oe_n <= 0;
                     end
                     cyc_cnt <= cyc_cnt + 1;
-                    if (cyc_cnt == 2) begin
+                    if (cyc_cnt == 3) begin
                         rdata[31:16] <= sram_dq;
                     end
-                    if (cyc_cnt == 3) begin
+                    if (cyc_cnt == 4) begin
                         ce_n <= 1; oe_n <= 1;
                         lb_n <= 1; ub_n <= 1;
                         state <= ST_RD_DONE;
@@ -176,10 +176,10 @@ module sram_ctrl (
                 // ── WRITE LO (lower 16 bits) ───────
                 ST_WR_LO: begin
                     cyc_cnt <= cyc_cnt + 1;
-                    if (cyc_cnt == 2) begin
+                    if (cyc_cnt == 3) begin
                         we_n <= 1;
                     end
-                    if (cyc_cnt == 3) begin
+                    if (cyc_cnt == 4) begin
                         cyc_cnt <= 0;
                         ce_n <= 1; we_n <= 1;
                         state  <= ST_WR_HI;
@@ -194,10 +194,10 @@ module sram_ctrl (
                         ce_n <= 0; we_n <= 0;
                     end
                     cyc_cnt <= cyc_cnt + 1;
-                    if (cyc_cnt == 2) begin
+                    if (cyc_cnt == 3) begin
                         we_n <= 1;
                     end
-                    if (cyc_cnt == 3) begin
+                    if (cyc_cnt == 4) begin
                         ce_n <= 1; we_n <= 1;
                         dq_oe <= 0;
                         lb_n <= 1; ub_n <= 1;

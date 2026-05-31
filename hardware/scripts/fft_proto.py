@@ -18,6 +18,9 @@ CMD_FFT_CONFIG  = 0x51
 CMD_WRITE_DATA  = 0x41
 CMD_READ_RESULT = 0x21
 CMD_CONTROL     = 0x50
+CMD_SRAM_WRITE  = 0x42
+CMD_SRAM_READ   = 0x22
+CMD_SRAM_ADDR   = 0x52
 
 CTRL_START = 0x01
 CTRL_STOP  = 0x02
@@ -170,6 +173,42 @@ class FftProto:
                 return False
             time.sleep(poll_ms / 1000)
         return False
+
+    # ── SRAM Debug Commands ──────────────────────
+
+    def sram_set_addr(self, addr):
+        """Set SRAM byte-address pointer (19-bit)."""
+        data = bytes([(addr >> 16) & 0x07, (addr >> 8) & 0xFF, addr & 0xFF])
+        _, _, err = self._xfer_frame(CMD_SRAM_ADDR, data)
+        return err
+
+    def sram_write(self, word32):
+        """Write 32-bit word to SRAM at current pointer, auto-increment."""
+        data = bytes([(word32 >> 24) & 0xFF, (word32 >> 16) & 0xFF,
+                       (word32 >> 8) & 0xFF, word32 & 0xFF])
+        _, _, err = self._xfer_frame(CMD_SRAM_WRITE, data)
+        return err
+
+    def sram_read(self):
+        """Read 32-bit word from SRAM at current pointer, auto-increment."""
+        cmd, data, err = self._xfer_frame(CMD_SRAM_READ, b'', expected_len=4)
+        if err:
+            return None, err
+        if len(data) < 4:
+            return None, f"Got {len(data)} bytes, expected 4"
+        return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3], None
+
+    def sram_test(self, addr=0, pattern=0xA5A55A5A):
+        """Quick SRAM test: write pattern, read back, verify."""
+        err = self.sram_set_addr(addr)
+        if err: return f"ADDR err: {err}"
+        err = self.sram_write(pattern)
+        if err: return f"WRITE err: {err}"
+        val, err = self.sram_read()
+        if err: return f"READ err: {err}"
+        if val != pattern:
+            return f"MISMATCH: wrote 0x{pattern:08X}, got 0x{val:08X}"
+        return None  # OK
 
 
 def main():
