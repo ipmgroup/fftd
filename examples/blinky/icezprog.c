@@ -45,9 +45,21 @@ static int gh = -1;
 static inline void gpio_write(int pin, int val) { lgGpioWrite(gh, pin, val); }
 static inline int  gpio_read(int pin)            { return lgGpioRead(gh, pin); }
 
-// ── SPI bit-bang helpers ────────────────────────────
-static void spi_begin(void) { gpio_write(CFG_SS, 0); }
-static void spi_end(void)   { gpio_write(CFG_SS, 1); }
+// ── Flash mode: swap SI/SO directions ───────────────
+// FPGA config: CFG_SI(6)=OUT, CFG_SO(13)=IN
+// Flash access: CFG_SO(13)=OUT, CFG_SI(6)=IN
+static void flash_mode_enter(void) {
+    lgGpioFree(gh, CFG_SI);
+    lgGpioFree(gh, CFG_SO);
+    lgGpioClaimInput(gh, 0, CFG_SI);    // Flash SO → Pi reads
+    lgGpioClaimOutput(gh, 0, CFG_SO, 0); // Flash SI ← Pi drives
+}
+static void flash_mode_leave(void) {
+    lgGpioFree(gh, CFG_SI);
+    lgGpioFree(gh, CFG_SO);
+    lgGpioClaimOutput(gh, 0, CFG_SI, 0); // FPGA SI ← Pi drives
+    lgGpioClaimInput(gh, 0, CFG_SO);     // FPGA SO → Pi reads
+}
 
 static uint32_t spi_xfer(uint32_t data, int nbits) {
     uint32_t rdata = 0;
@@ -114,59 +126,66 @@ static void prog_sram(FILE *f) {
         fprintf(stderr, "⚠️  CDONE is low — programming may have failed\n");
 }
 
-// ── Flash Helpers ───────────────────────────────────
+// ── Flash bit-bang (SI/SO SWAPPED vs FPGA config!) ──
+// For flash access: Pi → CFG_SO(13) → Flash SI, Pi ← CFG_SI(6) ← Flash SO
+static uint32_t flash_spi_xfer(uint32_t data, int nbits) {
+    uint32_t rdata = 0;
+    for (int i = nbits-1; i >= 0; i--) {
+        gpio_write(CFG_SO, (data >> i) & 1);  // MOSI to flash = CFG_SO
+        gpio_write(CFG_SCK, 1);
+        if (gpio_read(CFG_SI)) rdata |= (1 << i);  // MISO from flash = CFG_SI
+        gpio_write(CFG_SCK, 0);
+    }
+    return rdata;
+}
+
+static void flash_spi_begin(void) { gpio_write(CFG_SS, 0); }
+static void flash_spi_end(void)   { gpio_write(CFG_SS, 1); }
 static void flash_power_up(void) {
-    spi_begin();
-    spi_xfer(0xAB, 8);  // release from deep power-down
-    spi_end();
+    flash_spi_begin();
+    flash_spi_xfer(0xAB, 8);  // release from deep power-down
+    flash_spi_end();
     usleep(100);
 }
 
 static void flash_read_id(void) {
-    spi_begin();
-    spi_xfer(0x9F, 8);
-    uint8_t mfg = spi_xfer(0, 8);
-    uint8_t mem = spi_xfer(0, 8);
-    uint8_t cap = spi_xfer(0, 8);
-    spi_end();
+    flash_spi_begin();
+    flash_spi_xfer(0x9F, 8);
+    uint8_t mfg = flash_spi_xfer(0, 8);
+    uint8_t mem = flash_spi_xfer(0, 8);
+    uint8_t cap = flash_spi_xfer(0, 8);
+    flash_spi_end();
     printf("Flash ID: %02X %02X %02X\n", mfg, mem, cap);
 }
 
 static void flash_write_enable(void) {
-    spi_begin();
-    spi_xfer(0x06, 8);
-    spi_end();
-}
-
-static void flash_wait_busy(void) {
-    spi_begin();
-    spi_xfer(0x05, 8);
-    while (spi_xfer(0, 8) & 1) { usleep(1000); }
-    spi_end();
+    flash_spi_begin();
+    flash_spi_xfer(0x06, 8);
+    flash_spi_end();
 }
 
 static void flash_erase_sector(uint32_t addr) {
     flash_write_enable();
-    spi_begin();
-    spi_xfer(0x20, 8);
-    spi_xfer(addr >> 16, 8);
-    spi_xfer(addr >> 8, 8);
-    spi_xfer(addr, 8);
-    spi_end();
-    flash_wait_busy();
+    flash_spi_begin();
+    flash_spi_xfer(0x20, 8);
+    flash_spi_xfer(addr >> 16, 8);
+    flash_spi_xfer(addr >> 8, 8);
+    flash_spi_xfer(addr, 8);
+    flash_spi_end();
+    usleep(100000);  // 100ms for sector erase
 }
 
 static void flash_program_page(uint32_t addr, uint8_t *data, int len) {
     flash_write_enable();
-    spi_begin();
-    spi_xfer(0x02, 8);
-    spi_xfer(addr >> 16, 8);
-    spi_xfer(addr >> 8, 8);
-    spi_xfer(addr, 8);
+    flash_spi_begin();
+    flash_spi_xfer(0x02, 8);
+    flash_spi_xfer(addr >> 16, 8);
+    flash_spi_xfer(addr >> 8, 8);
+    flash_spi_xfer(addr, 8);
     for (int i = 0; i < len; i++)
-        spi_xfer(data[i], 8);
-    spi_end();
-    flash_wait_busy();
+        flash_spi_xfer(data[i], 8);
+    flash_spi_end();
+    usleep(10000);  // 10ms for page program
 }
 
 // ── Program Flash ───────────────────────────────────
@@ -174,6 +193,7 @@ static void flash_program_page(uint32_t addr, uint8_t *data, int len) {
 // so the FPGA is in reset and the SPI flash bus is accessible.
 static void prog_flash(FILE *f) {
     printf("Erasing Flash sector 0...\n");
+    flash_mode_enter();
     flash_power_up();
     flash_read_id();
     flash_erase_sector(0);
@@ -189,21 +209,48 @@ static void prog_flash(FILE *f) {
         if (total % 4096 == 0) printf("  %d bytes...\n", total);
     }
     printf("✅ Flash programmed (%d bytes)\n", total);
+    flash_mode_leave();
+}
+
+// ── Release all GPIOs to Hi-Z (like Python GPIO.cleanup) ──
+// For each pin: claim as INPUT with no pull, then free.
+// This matches what RPi.GPIO.cleanup() does via lgpio.
+static void release_all_pins(void) {
+    int pins[] = {CFG_SS, CFG_SCK, CFG_SI, CFG_SO, CFG_RST, CFG_DONE};
+    for (int i = 0; i < 6; i++) {
+        lgGpioClaimInput(gh, 0, pins[i]);  // input, no pull (SET_PULL_NONE=0)
+        lgGpioFree(gh, pins[i]);
+    }
+    lgGpiochipClose(gh);
+    gh = -1;
 }
 
 // ── Boot from Flash ─────────────────────────────────
-// SS_B must be HIGH when CRESET_B is released so FPGA boots as SPI master.
+// Release all pins so FPGA can drive SPI bus as master.
 static void boot_from_flash(void) {
     printf("Booting FPGA from Flash...\n");
+    fflush(stdout);
+    // Ensure SS_B HIGH at CRESET release for SPI Master mode
     gpio_write(CFG_SS, 1);
     gpio_write(CFG_RST, 0);
-    usleep(2000);
+    usleep(10000);
     gpio_write(CFG_RST, 1);
+    usleep(2000);  // 2ms for FPGA to sample mode pins
+    // Release ALL pins (like Python GPIO.cleanup())
+    release_all_pins();
     usleep(500000);
-    if (gpio_read(CFG_DONE))
-        printf("✅ FPGA booted from Flash\n");
-    else
-        fprintf(stderr, "⚠️  CDONE is low\n");
+    // Quick check: re-open to read CDONE
+    struct stat st;
+    int chip = (stat("/dev/gpiochip4", &st) == 0) ? 4 : 0;
+    int h = lgGpiochipOpen(chip);
+    if (h >= 0) {
+        lgGpioClaimInput(h, 0, CFG_DONE);
+        if (lgGpioRead(h, CFG_DONE))
+            printf("✅ FPGA booted from Flash\n");
+        else
+            fprintf(stderr, "⚠️  CDONE is low\n");
+        lgGpiochipClose(h);
+    }
 }
 
 // ── Main ────────────────────────────────────────────
@@ -236,6 +283,25 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], ".") == 0) {
         prog_flash(stdin);
         boot_from_flash();
+        return 0;
+    } else if (strcmp(argv[1], "..") == 0) {
+        // Boot only: set SS high, pulse reset, release pins
+        gpio_write(CFG_SS, 1);
+        gpio_write(CFG_RST, 0);
+        usleep(10000);
+        gpio_write(CFG_RST, 1);
+        usleep(2000);
+        release_all_pins();
+        usleep(500000);
+        // Check CDONE
+        chip = (stat("/dev/gpiochip4", &st) == 0) ? 4 : 0;
+        int h = lgGpiochipOpen(chip);
+        if (h >= 0) {
+            lgGpioClaimInput(h, 0, CFG_DONE);
+            printf(lgGpioRead(h, CFG_DONE) ? "✅ FPGA booted from Flash\n" : "⚠️  CDONE is low\n");
+            lgGpiochipClose(h);
+        }
+        return 0;
     } else {
         FILE *f = fopen(argv[1], "rb");
         if (!f) { perror(argv[1]); lgGpiochipClose(gh); return 1; }

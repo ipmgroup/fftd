@@ -172,10 +172,41 @@ class IceZeroProg:
         else:
             print("⚠️  CDONE is low — check connections")
 
+    def _flash_spi_xfer(self, data, nbits=8):
+        """Bit-bang SPI for Flash access.
+
+        Flash uses SWAPPED SI/SO relative to FPGA config:
+        - Flash SI ← Pi drives CFG_SO (BCM 13) → FPGA pin 67 → Flash SI
+        - Flash SO → Pi reads CFG_SI (BCM 6) ← FPGA pin 68 ← Flash SO
+        """
+        result = 0
+        for i in range(nbits - 1, -1, -1):
+            GPIO.output(CFG_SO, (data >> i) & 1)   # MOSI to flash = CFG_SO
+            time.sleep(0.00001)
+            if GPIO.input(CFG_SI):                  # MISO from flash = CFG_SI
+                result |= (1 << i)
+            time.sleep(0.00001)
+            GPIO.output(CFG_SCK, GPIO.HIGH)
+            time.sleep(0.00001)
+            GPIO.output(CFG_SCK, GPIO.LOW)
+            time.sleep(0.00001)
+        return result
+
+    def _flash_mode_enter(self):
+        """Swap SI/SO directions for flash access."""
+        GPIO.setup(CFG_SI, GPIO.IN)         # Flash SO → Pi reads
+        GPIO.setup(CFG_SO, GPIO.OUT)        # Flash SI ← Pi drives
+
+    def _flash_mode_leave(self):
+        """Restore SI/SO directions for FPGA config."""
+        GPIO.setup(CFG_SI, GPIO.OUT)        # FPGA SI ← Pi drives
+        GPIO.setup(CFG_SO, GPIO.IN)         # FPGA SO → Pi reads
+
     def flash_power_up(self):
         """Wake Flash from deep power-down (0xAB command)."""
+        self._flash_mode_enter()
         self.spi_begin()
-        self.spi_xfer(0xAB)
+        self._flash_spi_xfer(0xAB)
         self.spi_end()
         time.sleep(0.01)
 
@@ -183,11 +214,12 @@ class IceZeroProg:
         """Read SPI Flash manufacturer/device ID."""
         self.flash_power_up()
         self.spi_begin()
-        self.spi_xfer(0x9F)
-        mfg = self.spi_xfer(0)
-        dev = self.spi_xfer(0)
-        cap = self.spi_xfer(0)
+        self._flash_spi_xfer(0x9F)
+        mfg = self._flash_spi_xfer(0)
+        dev = self._flash_spi_xfer(0)
+        cap = self._flash_spi_xfer(0)
         self.spi_end()
+        self._flash_mode_leave()
         size_mb = 1 << cap
         print(f"Flash: MFG=0x{mfg:02X} DEV=0x{dev:02X} SIZE={size_mb} MB")
 
@@ -195,11 +227,12 @@ class IceZeroProg:
         """Bulk erase SPI Flash (0xC7) with fixed wait."""
         self.flash_power_up()
         self.spi_begin()
-        self.spi_xfer(0x06)  # Write enable
+        self._flash_spi_xfer(0x06)  # Write enable
         self.spi_end()
         self.spi_begin()
-        self.spi_xfer(0xC7)  # Bulk erase
+        self._flash_spi_xfer(0xC7)  # Bulk erase
         self.spi_end()
+        self._flash_mode_leave()
         print("Erasing Flash...")
         time.sleep(15)
         print("Erase complete")
@@ -209,33 +242,65 @@ class IceZeroProg:
         with open(bitfile, 'rb') as f:
             data = f.read()
 
+        self._flash_mode_enter()
         self.flash_erase()
+        self._flash_mode_enter()  # flash_erase calls _flash_mode_leave
 
-        for addr in range(0, len(data), 256):
+        total = len(data)
+        for addr in range(0, total, 256):
             chunk = data[addr:addr + 256]
             self.spi_begin()
-            self.spi_xfer(0x06)  # Write enable
+            self._flash_spi_xfer(0x06)  # Write enable
             self.spi_end()
             self.spi_begin()
-            self.spi_xfer(0x02)  # Page program
-            self.spi_xfer((addr >> 16) & 0xFF)
-            self.spi_xfer((addr >> 8) & 0xFF)
-            self.spi_xfer(addr & 0xFF)
+            self._flash_spi_xfer(0x02)  # Page program
+            self._flash_spi_xfer((addr >> 16) & 0xFF)
+            self._flash_spi_xfer((addr >> 8) & 0xFF)
+            self._flash_spi_xfer(addr & 0xFF)
             for b in chunk:
-                self.spi_xfer(b)
+                self._flash_spi_xfer(b)
             self.spi_end()
+            if addr % 8192 == 0:
+                print(f"  {addr} / {total} bytes...")
             time.sleep(0.01)
 
+        self._flash_mode_leave()
         print(f"Flash programmed ({len(data)} bytes)")
+        # Release pins so FPGA can boot from flash
+        self.cleanup()
+        time.sleep(0.5)
+        # Check CDONE
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(CFG_DONE, GPIO.IN)
+        done = GPIO.input(CFG_DONE)
+        GPIO.cleanup()
+        if done:
+            print("\u2705 FPGA booted from Flash")
+        else:
+            print("\u26a0\ufe0f  CDONE is low — try 'icezprog.py --reset'")
 
     def boot_flash(self):
-        """Reset FPGA to boot from Flash."""
+        """Reset FPGA to boot from Flash.
+        
+        Releases all CFG pins to Hi-Z so the FPGA can drive the SPI bus
+        as a master and load its configuration from the flash chip.
+        """
         print("Booting from Flash...")
+        # Ensure SS_B is HIGH before release (SPI Master mode)
+        GPIO.setup(CFG_SS, GPIO.OUT, initial=GPIO.HIGH)
         GPIO.output(CFG_RST, GPIO.LOW)
-        time.sleep(0.002)
+        time.sleep(0.01)
         GPIO.output(CFG_RST, GPIO.HIGH)
+        time.sleep(0.001)
+        # Release ALL pins to Hi-Z — FPGA takes over SPI bus
+        self.cleanup()
         time.sleep(0.5)
-        if GPIO.input(CFG_DONE) == GPIO.HIGH:
+        # Quick check: re-init just to read CDONE
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(CFG_DONE, GPIO.IN)
+        done = GPIO.input(CFG_DONE)
+        GPIO.cleanup()
+        if done:
             print("✅ FPGA booted from Flash")
         else:
             print("⚠️  CDONE is low")
