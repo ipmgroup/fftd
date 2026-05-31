@@ -85,6 +85,22 @@ class FftProto:
 
         return r_cmd, r_data, None
 
+    def write_data(self, samples):
+        """Write real-only int16 samples to FPGA BRAM (preload)."""
+        import time
+        MAX_CHUNK = 120  # 240 bytes < 255 LEN limit
+        for offset in range(0, len(samples), MAX_CHUNK):
+            chunk = samples[offset:offset+MAX_CHUNK]
+            data_out = b''
+            for s in chunk:
+                v = int(s) & 0xFFFF
+                data_out += bytes([(v >> 8) & 0xFF, v & 0xFF])
+            _, _, err = self._xfer_frame(CMD_WRITE_DATA, data_out)
+            if err:
+                return err
+            time.sleep(0.01)  # 10ms gap — let FPGA settle
+        return None
+
     def status(self):
         """Read STATUS register."""
         cmd, data, err = self._xfer_frame(CMD_STATUS_REQ, b'', expected_len=1)

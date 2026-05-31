@@ -152,34 +152,100 @@ module fft_top (
         end
     end
 
-    // ── FFT Input: internal test ramp ─────────────
-    reg [10:0] data_cnt;  // counts how many values fed (0..N)
+    // ── SPI Data Buffer (1024×16-bit BRAM) ────────
+    (* syn_ramstyle = "block_ram" *) reg [15:0] data_buf [0:N-1];
+    reg [N_LOG2-1:0]  buf_waddr, buf_raddr;
+    reg [15:0]         buf_wdata;
+    reg                buf_we;
+    reg [15:0]         buf_rdata;
+
+    always @(posedge clk) begin
+        if (buf_we) data_buf[buf_waddr] <= buf_wdata;
+        buf_rdata <= data_buf[buf_raddr];
+    end
+
+    // SPI → buffer write state
+    reg        spi_data_mode;
+    reg        spi_byte_hi;
+    reg [15:0] spi_sample;
+    reg [N_LOG2-1:0] spi_wr_addr;
+    reg [10:0] buf_feed_cnt;     // how many samples fed from buffer to FFT
+    reg        buf_feeding;      // 1 = feeding buffer to FFT
+
+    // SPI data mode + buffer write
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            spi_data_mode <= 0; spi_byte_hi <= 0; spi_sample <= 0;
+            spi_wr_addr <= 0; buf_we <= 0;
+            buf_feed_cnt <= 0; buf_feeding <= 0;
+        end else begin
+            buf_we <= 0;
+            if (cmd_valid && cmd_byte == 8'h41) begin
+                spi_data_mode <= 1; spi_byte_hi <= 0; spi_wr_addr <= 0;
+                buf_feed_cnt <= 0;
+            end
+            if (fft_done) begin
+                spi_data_mode <= 0; buf_feeding <= 0;
+            end
+            // SPI byte assembly + buffer write
+            if (rx_data_valid && spi_data_mode && !fft_busy) begin
+                if (!spi_byte_hi) begin
+                    spi_sample[15:8] <= rx_data_byte;
+                    spi_byte_hi <= 1;
+                end else begin
+                    spi_sample[7:0] <= rx_data_byte;
+                    spi_byte_hi <= 0;
+                    buf_waddr <= spi_wr_addr;
+                    buf_wdata <= spi_sample;
+                    buf_we <= 1;
+                    spi_wr_addr <= spi_wr_addr + 1;
+                end
+            end
+            // CTRL_START → begin feeding buffer to FFT
+            if (fft_start_r && spi_data_mode)
+                buf_feeding <= 1;
+        end
+    end
+
+    // Buffer feed to FFT (sequential read)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            buf_raddr <= 0;
+        end else begin
+            if (buf_feeding && din_ready) begin
+                buf_raddr <= buf_raddr + 1;
+                buf_feed_cnt <= buf_feed_cnt + 1;
+            end
+            if (!buf_feeding)
+                buf_raddr <= 0;
+        end
+    end
+
+    // ── FFT Input: internal ramp OR buffer feed ────
+    reg [10:0] data_cnt;
     reg        din_valid;
-    reg [9:0]  feed_val;  // actual data value (0..N-1)
-    wire [2*W-1:0] din = {16'd0, feed_val};
+    reg [9:0]  feed_val;
+    wire [2*W-1:0] din = buf_feeding ? {16'd0, buf_rdata} : {16'd0, feed_val};
     wire       din_ready;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            data_cnt <= 0;
-            din_valid <= 0;
-            feed_val  <= 0;
+            data_cnt <= 0; din_valid <= 0; feed_val <= 0;
         end else begin
-            // Restart counter on FFT start or soft reset
             if (fft_start_cmd || soft_rst) begin
-                data_cnt <= 0;
-                feed_val  <= 0;
+                data_cnt <= 0; feed_val <= 0;
             end
-
-            // Feed N values, then stop
-            if (data_cnt < N) begin
-                din_valid <= 1;
-                if (din_ready) begin
-                    data_cnt <= data_cnt + 1;
-                    feed_val <= feed_val + 1;
-                end
+            if (!spi_data_mode) begin
+                if (data_cnt < N) begin
+                    din_valid <= 1;
+                    if (din_ready) begin
+                        data_cnt <= data_cnt + 1;
+                        feed_val <= feed_val + 1;
+                    end
+                end else din_valid <= 0;
             end else begin
-                din_valid <= 0;
+                // Buffer feed mode: valid while feeding, FFT counts to N
+                din_valid <= buf_feeding;
             end
         end
     end
