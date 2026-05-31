@@ -1,5 +1,6 @@
 //=============================================================================
-// fft_core — Radix-2 DIT FFT. SINGLE always block — no races.
+// fft_core — Radix-2 DIT FFT. No bram_ext — saves 8 BRAMs.
+// External read reuses rd_a port during idle.
 //=============================================================================
 
 `timescale 1ns / 1ps
@@ -33,21 +34,19 @@ module fft_core #(
     reg               bram_we;
     reg [2*WIDTH-1:0] rd_a, rd_b;
 
-    // BRAM port A/B — separate always block (no async reset) so Yosys infers SB_RAM40_4K
+    // BRAM — single always block, Yosys infers SB_RAM40_4K
     always @(posedge clk) begin
         if (bram_we) bram[bram_wr] <= bram_wdata;
         rd_a <= bram[bram_rd_a];
         rd_b <= bram[bram_rd_b];
     end
 
-    // External read port — separate BRAM instance
-    (* syn_ramstyle = "block_ram" *) reg [2*WIDTH-1:0] bram_ext [0:N-1];
-    reg [AW-1:0]  bram_ext_wr;
-    reg [2*WIDTH-1:0] bram_ext_wdata;
-    reg               bram_ext_we;
+    // External read: reuse rd_a port when idle
+    wire [AW-1:0] bram_rd_a_fsm;
+    assign bram_rd_a = busy ? bram_rd_a_fsm : ext_rd_addr;
+
     always @(posedge clk) begin
-        if (bram_ext_we) bram_ext[bram_ext_wr] <= bram_ext_wdata;
-        ext_rd_data <= bram_ext[ext_rd_addr];
+        if (!busy) ext_rd_data <= rd_a;
     end
 
     localparam TW_N = N - 1;
@@ -83,21 +82,20 @@ module fft_core #(
 
     assign din_ready = (state == S_LOAD);
 
-    // Counter-based butterfly addressing (no barrel shifters!)
-    reg [AW-1:0] upper, lower;      // current butterfly addresses
-    reg [AW-1:0] step;              // = 1 << pass
-    reg [AW-1:0] tw_cnt;            // twiddle offset within group
-    reg [AW-1:0] bf_in_group;       // butterflies done in current group
+    reg [AW-1:0] upper, lower;
+    reg [AW-1:0] step;
+    reg [AW-1:0] tw_cnt;
+    reg [AW-1:0] bf_in_group;
 
     assign tw_addr = ((1 << pass) - 1) + tw_cnt;
 
     reg  signed [WIDTH-1:0] mul_a, mul_b;
     reg  signed [WIDTH-1:0] mul_c;
     reg  signed [31:0]      mul_o;
-    wire signed [31:0]      mul_rnd = mul_o + 32'sh00004000;  // round 0.5 LSB for >>15
+    wire signed [31:0]      mul_rnd = mul_o + 32'sh00004000;
     reg signed [WIDTH-1:0] u_re, u_im, l_re, l_im;
     reg signed [WIDTH-1:0] acc0, acc1, acc2, acc3;
-    reg [AW-1:0]           wr_upper, wr_lower;  // write-back addresses (upper/lower delayed)
+    reg [AW-1:0]           wr_upper, wr_lower;
 
     wire signed [WIDTH-1:0] lw_re = acc0 - acc1;
     wire signed [WIDTH-1:0] lw_im = acc2 + acc3;
@@ -106,7 +104,6 @@ module fft_core #(
     wire signed [WIDTH-1:0] dif_re = u_re - lw_re;
     wire signed [WIDTH-1:0] dif_im = u_im - lw_im;
 
-    // FSM + multiplier (no direct BRAM access — uses bram_we/wr/wdata signals)
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state    <= S_IDLE;
@@ -119,12 +116,11 @@ module fft_core #(
             {wr_upper, wr_lower} <= 0;
             {upper, lower, step, tw_cnt, bf_in_group} <= 0;
             mul_o <= 0;
-            {bram_rd_a, bram_rd_b, bram_wr} <= 0;
+            {bram_rd_a_fsm, bram_rd_b, bram_wr} <= 0;
             bram_wdata <= 0;
-            bram_ext_we <= 0; bram_ext_wr <= 0; bram_ext_wdata <= 0;
         end else begin
             frame_done <= 0; dout_valid <= 0;
-            bram_we <= 0; bram_ext_we <= 0;
+            bram_we <= 0;
 
             mul_o <= mul_a * mul_b + mul_c;
 
@@ -132,11 +128,10 @@ module fft_core #(
                 S_IDLE: if (start) begin state <= S_LOAD; idx <= 0; busy <= 1; end
                 S_LOAD: if (din_valid) begin
                     bram_wr <= bit_reverse(idx); bram_wdata <= din; bram_we <= 1;
-                    bram_ext_wr <= bit_reverse(idx); bram_ext_wdata <= din; bram_ext_we <= 1;
                     if (idx == N - 1) state <= S_LOAD_DONE; else idx <= idx + 1;
                 end
                 S_LOAD_DONE: begin
-                    bram_rd_a<=0; bram_rd_b<=1; pass<=0; bf_idx<=0;
+                    bram_rd_a_fsm<=0; bram_rd_b<=1; pass<=0; bf_idx<=0;
                     upper<=0; lower<=1; step<=1; tw_cnt<=0; bf_in_group<=0;
                     state<=S_BF_RD;
                 end
@@ -146,10 +141,10 @@ module fft_core #(
                     l_re<=rd_b[15:0]; l_im<=rd_b[31:16];
                     mul_a<=rd_b[15:0]; mul_b<=tw_re; mul_c<=0;
                     if (bf_in_group == step - 1) begin
-                        bram_rd_a <= lower + 1;
+                        bram_rd_a_fsm <= lower + 1;
                         bram_rd_b <= lower + 1 + step;
                     end else begin
-                        bram_rd_a <= upper + 1;
+                        bram_rd_a_fsm <= upper + 1;
                         bram_rd_b <= lower + 1;
                     end
                     state<=S_BF_M1;
@@ -161,12 +156,10 @@ module fft_core #(
                 S_BF_M5: begin acc3<=mul_rnd>>>15; state<=S_BF_SUM; end
                 S_BF_SUM: begin
                     bram_wr<=wr_upper; bram_wdata<={sum_im,sum_re}; bram_we<=1;
-                    bram_ext_wr<=wr_upper; bram_ext_wdata<={sum_im,sum_re}; bram_ext_we<=1;
                     state<=S_BF_WR;
                 end
                 S_BF_WR: begin
                     bram_wr<=wr_lower; bram_wdata<={dif_im,dif_re}; bram_we<=1;
-                    bram_ext_wr<=wr_lower; bram_ext_wdata<={dif_im,dif_re}; bram_ext_we<=1;
                     state<=S_BF_WR2;
                 end
                 S_BF_WR2: begin
@@ -177,7 +170,7 @@ module fft_core #(
                             pass<=pass+1; step<=step<<1;
                             upper<=0; lower<=step<<1;
                             tw_cnt<=0; bf_in_group<=0;
-                            bram_rd_a<=0; bram_rd_b<=step<<1;
+                            bram_rd_a_fsm<=0; bram_rd_b<=step<<1;
                             state<=S_BF_RD;
                         end
                     end else begin
@@ -196,17 +189,13 @@ module fft_core #(
                         state<=S_BF_RD;
                     end
                 end
-                S_UNLOAD: begin dout<=rd_a; dout_valid<=1; bram_rd_a<=idx+1; idx<=idx+1;
+                S_UNLOAD: begin dout<=rd_a; dout_valid<=1; bram_rd_a_fsm<=idx+1; idx<=idx+1;
                     if (idx==N-1) begin state<=S_IDLE; frame_done<=1; busy<=0; end
                 end
                 default: state <= S_IDLE;
             endcase
         end
     end
-
-    // External read port — separate BRAM
-    always @(posedge clk)
-        ext_rd_data <= bram_ext[ext_rd_addr];
 
     function [AW-1:0] bit_reverse;
         input [AW-1:0] in; integer i;

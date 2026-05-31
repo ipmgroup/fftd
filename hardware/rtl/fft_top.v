@@ -152,34 +152,104 @@ module fft_top (
         end
     end
 
-    // ── FFT Input: internal test ramp ─────────────
-    reg [10:0] data_cnt;  // counts how many values fed (0..N)
+    // ── SPI Data Buffer (1024×16-bit BRAM) ────────
+    (* syn_ramstyle = "block_ram" *) reg [15:0] data_buf [0:N-1];
+    reg [N_LOG2-1:0]  buf_waddr;
+    reg [15:0]        buf_wdata;
+    reg               buf_we;
+    reg [N_LOG2-1:0]  buf_raddr;
+    reg [15:0]        buf_rdata;
+
+    always @(posedge clk) begin
+        if (buf_we) data_buf[buf_waddr] <= buf_wdata;
+        buf_rdata <= data_buf[buf_raddr];
+    end
+
+    // ── SPI data mode + buffer write ──────────────
+    reg        spi_data_mode;
+    reg        spi_byte_hi;
+    reg [15:0] spi_sample;
+    reg [N_LOG2-1:0] spi_wr_addr;
+    reg        buf_feeding;
+    reg        buf_din_valid;
+    reg        spi_wr_pending;  // delay write 1 cycle for spi_sample to settle
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            spi_data_mode <= 0; spi_byte_hi <= 0; spi_sample <= 0;
+            spi_wr_addr <= 0; buf_we <= 0; spi_wr_pending <= 0;
+            buf_raddr <= 0; buf_feeding <= 0; buf_din_valid <= 0;
+        end else begin
+            buf_we <= 0;
+            if (cmd_valid && cmd_byte == 8'h41) begin
+                spi_data_mode <= 1; spi_byte_hi <= 0; spi_wr_addr <= 0;
+                buf_raddr <= 0; spi_wr_pending <= 0;
+            end
+            if (fft_done) begin
+                spi_data_mode <= 0; buf_feeding <= 0;
+            end
+            // SPI byte assembly → write pending
+            if (rx_data_valid && spi_data_mode && !fft_busy) begin
+                if (!spi_byte_hi) begin
+                    spi_sample[15:8] <= rx_data_byte;
+                    spi_byte_hi <= 1;
+                end else begin
+                    spi_sample[7:0] <= rx_data_byte;
+                    spi_byte_hi <= 0;
+                    spi_wr_pending <= 1;  // write next cycle when spi_sample settled
+                end
+            end
+            // Delayed write: spi_sample is now fully updated
+            if (spi_wr_pending) begin
+                spi_wr_pending <= 0;
+                buf_waddr <= spi_wr_addr;
+                buf_wdata <= spi_sample;
+                buf_we <= 1;
+                spi_wr_addr <= spi_wr_addr + 1;
+            end
+            // CTRL_START → begin feeding buffer to FFT
+            if (fft_start_r && spi_data_mode)
+                buf_feeding <= 1;
+
+            // Feed with 1-cycle BRAM latency compensation
+            if (buf_feeding) begin
+                if (fft_busy && !din_ready) begin
+                    buf_din_valid <= 0;
+                end else begin
+                    buf_din_valid <= 1;
+                    if (buf_din_valid && din_ready)
+                        buf_raddr <= buf_raddr + 1;
+                end
+            end else begin
+                buf_din_valid <= 0;
+            end
+        end
+    end
+
+    // ── FFT Input: internal ramp OR buffer feed ────
+    reg [10:0] data_cnt;
     reg        din_valid;
-    reg [9:0]  feed_val;  // actual data value (0..N-1)
-    wire [2*W-1:0] din = {16'd0, feed_val};
+    reg [9:0]  feed_val;
+    wire [2*W-1:0] din = spi_data_mode ? {16'd0, buf_rdata} : {16'd0, feed_val};
     wire       din_ready;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            data_cnt <= 0;
-            din_valid <= 0;
-            feed_val  <= 0;
+            data_cnt <= 0; din_valid <= 0; feed_val <= 0;
         end else begin
-            // Restart counter on FFT start or soft reset
             if (fft_start_cmd || soft_rst) begin
-                data_cnt <= 0;
-                feed_val  <= 0;
+                data_cnt <= 0; feed_val <= 0;
             end
-
-            // Feed N values, then stop
-            if (data_cnt < N) begin
-                din_valid <= 1;
-                if (din_ready) begin
-                    data_cnt <= data_cnt + 1;
-                    feed_val <= feed_val + 1;
-                end
+            if (!spi_data_mode) begin
+                if (data_cnt < N) begin
+                    din_valid <= 1;
+                    if (din_ready) begin
+                        data_cnt <= data_cnt + 1;
+                        feed_val <= feed_val + 1;
+                    end
+                end else din_valid <= 0;
             end else begin
-                din_valid <= 0;
+                din_valid <= buf_din_valid;
             end
         end
     end
@@ -261,13 +331,11 @@ module fft_top (
     always @(*) begin
         tx_data_byte = status_byte;    // default: STATUS_REQ
         if (cmd_byte == 8'h21)  tx_data_byte = rd_byte;
-        if (cmd_byte == 8'h22)  tx_data_byte = sram_rd_byte;
         if (cmd_byte == 8'h41)  tx_data_byte = cmd_len;
-        if (cmd_byte == 8'h42)  tx_data_byte = 8'h04;  // SRAM_WRITE: echo 4 bytes
         if (cmd_error)          tx_data_byte = 8'h01;
     end
 
-    // ── Response length override (READ_RESULT, SRAM_READ) ────
+    // ── Response length override (READ_RESULT) ────
     reg [7:0] num_bins_r;
     always @(posedge clk) begin
         if (rx_data_valid && cmd_byte == 8'h21)
@@ -280,10 +348,6 @@ module fft_top (
             ext_resp_len   <= num_bins_r * 8'd2;  // 2 bytes/bin (re only)
             ext_resp_valid <= 1;
         end
-        if (in_gap && cmd_byte == 8'h22) begin
-            ext_resp_len   <= 8'd4;  // 4 bytes (32-bit word)
-            ext_resp_valid <= 1;
-        end
     end
 
     // ── LEDs ──────────────────────────────────────
@@ -291,132 +355,20 @@ module fft_top (
     assign led2 = din_valid;   // DEBUG: blink during data load
     assign led3 = drdy_r;
 
-    // ── SRAM Debug Commands ───────────────────────
-    // 0x52 SRAM_ADDR  → set SRAM byte-address pointer (3 bytes payload)
-    // 0x42 SRAM_WRITE → write 32-bit word, auto-inc pointer (+4)
-    // 0x22 SRAM_READ  → read 32-bit word, auto-inc pointer (+4)
-    reg [18:0] sram_ptr;
-    reg        sram_req_r;
-    reg        sram_op_write;   // 1=write, 0=read
-    reg        sram_op_busy;    // local FSM busy
-    reg [31:0] sram_wdata_r;
-    reg [31:0] sram_rdata_r;
-    reg        sram_rdata_valid_r;
-    reg [1:0]  sram_byte_cnt;   // 0..3 for address/data assembly
-
-    // SRAM command state
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sram_ptr <= 0;
-            sram_req_r <= 0;
-            sram_op_write <= 0;
-            sram_op_busy <= 0;
-            sram_wdata_r <= 0;
-            sram_rdata_r <= 0;
-            sram_rdata_valid_r <= 0;
-            sram_byte_cnt <= 0;
-        end else begin
-            sram_req_r <= 0;
-            sram_rdata_valid_r <= 0;
-
-            // SRAM_ADDR command: 3 bytes = 19-bit addr
-            if (rx_data_valid && cmd_byte == 8'h52) begin
-                case (sram_byte_cnt)
-                    2'd0: sram_ptr[18:16] <= rx_data_byte[2:0];
-                    2'd1: sram_ptr[15:8]  <= rx_data_byte;
-                    2'd2: sram_ptr[7:0]   <= rx_data_byte;
-                endcase
-                sram_byte_cnt <= sram_byte_cnt + 1;
-            end
-
-            // SRAM_WRITE command: 4 bytes = 32-bit word
-            if (rx_data_valid && cmd_byte == 8'h42) begin
-                case (sram_byte_cnt)
-                    2'd0: sram_wdata_r[31:24] <= rx_data_byte;
-                    2'd1: sram_wdata_r[23:16] <= rx_data_byte;
-                    2'd2: sram_wdata_r[15:8]  <= rx_data_byte;
-                    2'd3: begin
-                        sram_wdata_r[7:0] <= rx_data_byte;
-                        sram_req_r <= 1;
-                        sram_op_write <= 1;
-                        sram_op_busy <= 1;
-                    end
-                endcase
-                if (sram_byte_cnt == 2'd3)
-                    sram_byte_cnt <= 0;
-                else
-                    sram_byte_cnt <= sram_byte_cnt + 1;
-            end
-
-            // SRAM_READ command: no payload, issue read immediately
-            if (cmd_valid && cmd_byte == 8'h22 && !sram_op_busy) begin
-                sram_req_r <= 1;
-                sram_op_write <= 0;
-                sram_op_busy <= 1;
-            end
-
-            // SRAM operation done
-            if (sram_op_busy && sram_done) begin
-                sram_op_busy <= 0;
-                if (!sram_op_write) begin
-                    sram_rdata_r <= sram_rdata;
-                    sram_rdata_valid_r <= 1;
-                end
-                sram_ptr <= sram_ptr + 19'd4;
-            end
-
-            // Reset byte counter on new command
-            if (cmd_valid && cmd_byte != 8'h52 && cmd_byte != 8'h42)
-                sram_byte_cnt <= 0;
-        end
-    end
-
-    // SRAM controller request mux
-    wire        sram_req   = sram_req_r;
-    wire        sram_wr    = sram_op_write;
-    wire [18:0] sram_addr  = sram_ptr;
-    wire [31:0] sram_wdata = sram_wdata_r;
+    // ── SRAM Controller (for future data buffer) ──
+    // Currently idle: Pi↔SRAM data path via WRITE_DATA/READ_RESULT TBD
+    wire        sram_req;
+    wire        sram_wr;
+    wire [18:0] sram_addr;
+    wire [31:0] sram_wdata;
     wire [31:0] sram_rdata;
     wire        sram_busy, sram_done, sram_rvalid;
 
-    // SRAM_READ response data byte mux
-    reg [1:0] sram_rd_byte_cnt;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sram_rd_byte_cnt <= 0;
-        end else begin
-            if (cmd_valid && cmd_byte == 8'h22)
-                sram_rd_byte_cnt <= 0;
-            if (tx_rd && cmd_byte == 8'h22)
-                sram_rd_byte_cnt <= sram_rd_byte_cnt + 1;
-        end
-    end
-
-    wire [7:0] sram_rd_byte =
-        (sram_rd_byte_cnt == 2'd0) ? sram_rdata_r[31:24] :
-        (sram_rd_byte_cnt == 2'd1) ? sram_rdata_r[23:16] :
-        (sram_rd_byte_cnt == 2'd2) ? sram_rdata_r[15:8]  :
-                                     sram_rdata_r[7:0];
-
-    // ── SB_IO for SRAM data bus (per icotools example) ──
-    wire [15:0] sram_din;        // data FROM SRAM (registered by SB_IO)
-    wire [15:0] sram_dout;       // data TO SRAM
-    wire        sram_oe_n;       // SRAM OE# — also used as SB_IO OUTPUT_ENABLE
-
-    genvar gi;
-    generate
-        for (gi = 0; gi < 16; gi = gi + 1) begin : sram_dio
-            SB_IO #(
-                .PIN_TYPE(6'b1010_01),  // input registered, output no reg, enable registered
-                .PULLUP(1'b0)
-            ) dio (
-                .PACKAGE_PIN(sram_dq[gi]),
-                .OUTPUT_ENABLE(sram_oe_n),    // same signal as SRAM OE#!
-                .D_OUT_0(sram_dout[gi]),
-                .D_IN_0(sram_din[gi])
-            );
-        end
-    endgenerate
+    // Tie SRAM to idle for now (no requests)
+    assign sram_req  = 1'b0;
+    assign sram_wr   = 1'b0;
+    assign sram_addr = 19'd0;
+    assign sram_wdata = 32'd0;
 
     sram_ctrl sram (
         .clk        (clk),
@@ -430,8 +382,7 @@ module fft_top (
         .done       (sram_done),
         .rdata_valid(sram_rvalid),
         .sram_a     (sram_a),
-        .sram_din   (sram_din),
-        .sram_dout  (sram_dout),
+        .sram_dq    (sram_dq),
         .sram_ce_n  (sram_ce_n),
         .sram_oe_n  (sram_oe_n),
         .sram_we_n  (sram_we_n),
