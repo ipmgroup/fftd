@@ -168,8 +168,16 @@ class IceZeroProg:
         else:
             print("⚠️  CDONE is low — check connections")
 
+    def flash_power_up(self):
+        """Wake Flash from deep power-down (0xAB command)."""
+        self.spi_begin()
+        self.spi_xfer(0xAB)
+        self.spi_end()
+        time.sleep(0.001)
+
     def flash_read_id(self):
         """Read SPI Flash manufacturer/device ID."""
+        self.flash_power_up()
         self.spi_begin()
         self.spi_xfer(0x9F)
         mfg = self.spi_xfer(0)
@@ -181,6 +189,7 @@ class IceZeroProg:
 
     def flash_erase(self):
         """Bulk erase SPI Flash."""
+        self.flash_power_up()
         self.spi_begin()
         # Write enable
         self.spi_xfer(0x06)
