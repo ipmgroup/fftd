@@ -182,8 +182,8 @@ module fft_top (
         end else begin
             buf_we <= 0;
             if (cmd_valid && cmd_byte == 8'h41) begin
-                spi_data_mode <= 1; spi_byte_hi <= 0; spi_wr_addr <= 0;
-                buf_raddr <= 0; spi_wr_pending <= 0;
+                spi_data_mode <= 1; spi_byte_hi <= 0;
+                spi_wr_pending <= 0;
             end
             if (fft_done) begin
                 spi_data_mode <= 0; buf_feeding <= 0;
