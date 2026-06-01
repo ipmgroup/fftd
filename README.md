@@ -141,6 +141,13 @@ Dev PC (x86_64)                    Raspberry Pi + ICEZero (HAT)
 
 The ICEZero board mounts directly on the Raspberry Pi's 40-pin GPIO header (HAT form-factor). All communication — bitstream loading (via dedicated CFG_* pins) and data transfer — happens over SPI (8 MHz XOR-checksum protocol). No USB or external programmers required.
 
+## Support
+
+If you find this project useful, consider supporting it:
+
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/karu2003)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue?logo=paypal)](https://www.paypal.com/paypalme/BuckinAndrew)
+
 ## License
 
 MIT — see [LICENSE](LICENSE) file.
