@@ -1,9 +1,10 @@
 # SPI_PROTOCOL.md — Raspberry Pi ↔ ICE40HX4K FFT Engine
 
-**Version**: 1.1  
-**Date**: 2026-05-30  
+**Version**: 1.2  
+**Date**: 2026-06-04  
 **Status**: Production Ready  
-**Update**: XOR checksum instead of CRC8 to save FPGA resources
+**Update**: Complex (re+im) 4-byte/bin output with BFP exponent; dual-clock SPI
+domain (87.5 MHz) decoupled from the FFT core (43.75 MHz); reliable 16 MHz SCK
 
 ---
 
@@ -13,7 +14,9 @@ This document describes the SPI protocol for data exchange between Raspberry Pi 
 
 ### Key Parameters
 
-- **SPI Frequency**: 8 MHz (SPI0 on RPi, tested stable at 50 MHz sysclk)
+- **SPI Frequency**: up to **16 MHz SCK** (reliable). The SPI slave runs in its
+  own 87.5 MHz clock domain (`SB_PLL40_2F_PAD` GENCLK), decoupled from the
+  43.75 MHz FFT core (GENCLK_HALF) via clock-domain-crossing synchronisers.
 - **SPI Mode**: Mode 0 (CPOL=0, CPHA=0)
 - **Byte Order**: Big-endian (MSB first)
 - **Word Size**: 8 bits
@@ -103,16 +106,19 @@ MISO: [0x60] [0x01] [SEQ] [CHECKSUM] [STATUS]
 
 **STATUS byte**:
 ```
-Bit 7: Ready     (1 = ready for operation)
-Bit 6: Busy      (1 = processing in progress)
-Bit 5: Done      (1 = FFT completed)
-Bit 4: Error     (1 = error)
-Bit 3: Reserved
-Bit 2: Reserved
-Bit 1-0: Reserved
+Bit 7:   Ready    (1 = ready for operation)
+Bit 6:   Busy     (1 = processing in progress)
+Bit 5:   Done     (1 = FFT completed)
+Bit 4:   Reserved
+Bit 3-0: BFP exponent (block-floating-point shift count)
 ```
 
-**Example**: `0xC0` = Ready (bit 7) + Busy (bit 6) = processing
+The low nibble carries the **BFP exponent**: the host reconstructs true FFT
+values as `value << exp` (each stage that risked overflow was scaled down by ½
+during compute, and `exp` counts those shifts). `exp` is stable by the time
+`Done` is set.
+
+**Example**: `0x24` = Done (bit 5) + exp=4 → multiply read bins by 2⁴ = 16
 
 ---
 
@@ -198,17 +204,26 @@ MOSI: [0x21] [0x01] [SEQ] [CHECKSUM] [NUM_BINS]
       CMD     LEN           (0x21^0x01^SEQ) (number of bins)
 ```
 
-**Response** (FFT result, real part only, 2 bytes/bin):
+**Response** (FFT result, **complex**, 4 bytes/bin):
 ```
-MISO: [0x21] [N*2] [SEQ] [CHECKSUM] [B0_H] [B0_L] ... [BN_H] [BN_L]
-      CMD     LEN           (0x21^N*2^SEQ) (N*2 bytes: N bins × 2)
+MISO: [0x21] [N*4] [SEQ] [CHECKSUM] [Re0_H][Re0_L][Im0_H][Im0_L] ...
+      CMD     LEN           (0x21^N*4^SEQ) (N*4 bytes: N bins × 4)
 ```
 
-**Result format** (16-bit signed magnitude, big-endian):
+**Result format** (two 16-bit signed values, big-endian, real then imaginary):
 ```
-Each bin = 2 bytes
-[Bit15:8] [Bit7:0]
+Each bin = 4 bytes:  [Re15:8] [Re7:0] [Im15:8] [Im7:0]
 ```
+
+Each bin is still scaled by the BFP exponent from STATUS — multiply by
+`2**exp` to get true `numpy.fft` values.
+
+**Max bins per frame**: 63 (LEN is 8-bit → 63 × 4 = 252 ≤ 255). The read
+pointer auto-increments across frames; it resets to bin 0 on `frame_done`.
+
+**Hermitian shortcut (host-side)**: for real-valued input only the unique
+`N/2+1` bins need to be read; the host reconstructs the upper half via
+`X[N-k] = conj(X[k])`, roughly halving readout time.
 
 ---
 
@@ -357,10 +372,15 @@ uint8_t compute_checksum(uint8_t cmd, uint8_t len, uint8_t seq) {
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| SPI Clock | 8 MHz | Tested stable at 50 MHz sysclk |
-| Oversampling | 6.25× | 50 MHz / 8 MHz |
-| Max chunk size | 252 bytes | Limited by LEN field (8-bit) |
-| Recommended chunk | 240 bytes | 120 samples × 2 bytes |
+| SPI Clock | up to 16 MHz | Reliable; 17 MHz+ fails (oversampling limit) |
+| SPI domain | 87.5 MHz | GENCLK; oversamples SCK ~5.5× at 16 MHz |
+| FFT core domain | 43.75 MHz | GENCLK_HALF; CDC to the SPI domain |
+| Max chunk size | 252 bytes | Limited by LEN field (8-bit) = 63 complex bins |
+| Recommended chunk | 60 bins | 60 × 4 = 240 bytes/frame |
+
+The 4-byte/bin readout TX path emits each byte from the top of a shift
+register (`tx_word`) and prefetches the next bin two byte-periods ahead, so it
+keeps up with high SCK without a per-byte combinational mux.
 
 ---
 
@@ -397,6 +417,6 @@ uint8_t compute_checksum(uint8_t cmd, uint8_t len, uint8_t seq) {
 
 ---
 
-**Document version**: 1.1  
-**Last updated**: 2026-05-31  
+**Document version**: 1.2  
+**Last updated**: 2026-06-04  
 **Status**: Production Ready

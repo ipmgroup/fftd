@@ -7,6 +7,20 @@
 
 ---
 
+> **As-built note (2026-06-04).** This document is the original design spec.
+> The implemented system differs in a few key points; see `README.md` and
+> `fft_spi_protocol_doc.md` for current details:
+> - **Clocking is dual-domain**: SPI slave at 87.5 MHz, FFT core at 43.75 MHz
+>   (one `SB_PLL40_2F_PAD`, CDC between them) — not a single 50 MHz domain.
+>   The core clock is LUT-multiplier-bound (~73 MHz Fmax; ICE40HX has no DSP).
+> - **SPI SCK** is reliable up to **16 MHz** (not 8 MHz).
+> - **FFT output is complex** (re+im, 4 bytes/bin) with a block-floating-point
+>   exponent in the STATUS byte — not real-only, 2 bytes/bin.
+> - The 1024-point pipeline is the validated configuration (ramp correlates
+>   1.000000 with NumPy; chirp 0.999988).
+
+---
+
 ## Terms, Definitions and Abbreviations
 
 | Term | Definition |

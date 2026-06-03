@@ -9,10 +9,14 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 - **FPGA**: Lattice ICE40HX4K (3520 LUT4, 32 × 4 kbit BRAM)
 - **Board**: Trenz Electronic ICEZero (Raspberry Pi HAT form-factor)
 - **FFT size**: 1024-point Radix-2 DIT (configurable via parameter)
-- **Data width**: 16-bit Q1.15 fixed-point (real-only output via SPI)
-- **Throughput**: 269 000 bins/s (3.81 ms total per 1024-point FFT)
-- **Latency**: 1.13 ms compute + 2.68 ms SPI transfer (1024-point, 12 MHz SCK)
-- **SPI Protocol**: XOR checksum framing, 12 MHz SCK (max tested at 50 MHz sysclk)
+- **Data width**: 16-bit Q1.15 fixed-point; **complex (re+im) output** with a
+  block-floating-point (BFP) exponent for full dynamic range
+- **Accuracy**: BFP + convergent rounding — ramp input correlates 1.000000 with
+  NumPy (0/1024 bins fail), chirp 0.999988
+- **Clocking**: dual-clock — SPI domain **87.5 MHz**, FFT core **43.75 MHz**
+  (single `SB_PLL40_2F_PAD`, CDC across the boundary)
+- **SPI Protocol**: XOR-checksum framing, reliable up to **16 MHz SCK**
+- **Latency** (N=1024): ~1.1 ms compute + ~2.0 ms readout (Hermitian, 16 MHz SCK)
 
 ## Quick Start
 
@@ -98,24 +102,32 @@ reconstructed = fft.inverse(spectrum)
 | GCC | ≥ 9.0 |
 | Linux kernel | ≥ 5.10 (arm64 on Raspberry Pi) |
 
-## Performance (N=1024 FFT, Ramp Input)
+## Performance (N=1024 FFT)
 
-Benchmark comparing FPGA (ICE40HX4K, 50 MHz, 16-bit Q1.15) vs CPU (Raspberry Pi 5, 2.4 GHz Cortex-A76). FPGA compute time measured via SPI protocol polling, CPU via `perf_counter()` and FFTW3 C API.
+Benchmark comparing FPGA (ICE40HX4K, dual-clock 87.5/43.75 MHz, 16-bit Q1.15) vs CPU (Raspberry Pi 5, 2.4 GHz Cortex-A76). FPGA compute time measured via SPI status polling, CPU via `perf_counter()` and FFTW3 C API.
 
 | Method | Time/FFT | vs FPGA | Notes |
 |--------|----------|---------|-------|
-| **FPGA** ICE40HX4K | **3.81 ms** | 1× | 1.13 ms compute + 2.68 ms SPI @ 12 MHz |
-| FPGA compute only | 1.13 ms | — | 50 MHz, Radix-2 DIT, DC=-547 stable |
-| numpy.fft float64 | 25 µs | 237× | NEON-optimized, 64-bit float |
-| numpy.fft float32 | 25 µs | 242× | NEON-optimized, 32-bit float |
-| **FFTW3** float32 | **6.6 µs** | **916×** | C API, `-O3 -march=native` |
+| **FPGA** ICE40HX4K | **4.25 ms** | 1× | 2.22 ms compute (poll-inflated) + 2.03 ms readout @ 16 MHz |
+| FPGA compute only | ~1.1 ms | — | 43.75 MHz core; measured 2.22 ms is poll-quantized (poll_ms=1) |
+| FPGA readout (Hermitian) | 2.03 ms | — | 513 complex bins @ 16 MHz SCK |
+| numpy.fft float64 | 16 µs | 269× | NEON-optimized, 64-bit float |
+| numpy.fft float32 | 16 µs | 272× | NEON-optimized, 32-bit float |
+| **FFTW3** float32 | **4.4 µs** | **967×** | C API, `-O3 -march=native` |
 
-**FPGA resources**: 1960/7680 LC — 25% (ICE40HX4K: 3520 LUT4 + 3520 FF), 28/32 BRAM (87%), Fmax 71.8 MHz @ 50 MHz.
+**FPGA resources**: 2430/7680 LC — 31% (ICE40HX4K: 3520 LUT4 + 3520 FF), 28/32 BRAM (87%). Fmax: SPI domain 95 MHz (runs at 87.5), core domain 73 MHz (runs at 43.75).
 
 **Why CPU is faster for N=1024**:
-- 2.4 GHz vs 50 MHz = 48× clock advantage
+- 2.4 GHz vs 43.75 MHz = 55× clock advantage
 - NEON SIMD: 4× float32 per instruction
 - FFTW auto-tunes to optimal algorithm for the specific CPU
+- ICE40HX has no hardened DSP/multiplier blocks — the 16×16 butterfly multiply
+  is LUT-based, capping the core clock (~73 MHz Fmax)
+
+**Where the FPGA time goes**: readout is now dominated by per-transaction
+overhead (9 SPI frames of 63 bins each, limited by the 8-bit LEN field) plus
+spidev/Python gaps, not raw SCK — so a streaming-read protocol would help more
+than a faster clock.
 
 **When FPGA wins**:
 - **Streaming**: zero CPU overhead, deterministic latency
@@ -139,7 +151,7 @@ Dev PC (x86_64)                    Raspberry Pi + ICEZero (HAT)
   cross-compile lib    ──────────→  run tests & profile
 ```
 
-The ICEZero board mounts directly on the Raspberry Pi's 40-pin GPIO header (HAT form-factor). All communication — bitstream loading (via dedicated CFG_* pins) and data transfer — happens over SPI (8 MHz XOR-checksum protocol). No USB or external programmers required.
+The ICEZero board mounts directly on the Raspberry Pi's 40-pin GPIO header (HAT form-factor). All communication — bitstream loading (via dedicated CFG_* pins, flashed with the cross-compiled `icezprog` in ~2.3 s) and data transfer — happens over SPI (XOR-checksum protocol, up to 16 MHz SCK). No USB or external programmers required.
 
 ## Support
 
