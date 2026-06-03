@@ -13,7 +13,10 @@ import numpy as np
 
 # Import from sibling dir
 sys.path.insert(0, '.')
-from hardware.scripts.fft_proto import FftProto, CMD_CONTROL, CTRL_START, CTRL_RESET
+try:
+    from hardware.scripts.fft_proto import FftProto, CMD_CONTROL, CTRL_START, CTRL_RESET
+except ImportError:
+    from fft_proto import FftProto, CMD_CONTROL, CTRL_START, CTRL_RESET
 
 N = 1024
 MAX_Q = 32767
@@ -38,6 +41,16 @@ def main():
         print("Resetting FPGA...")
         proto.control(CTRL_RESET)
         time.sleep(0.1)
+
+    # ── Write ramp data (0..N-1) ──────────────────
+    print(f"Writing ramp 0..{N-1} to FPGA...")
+    ramp = np.arange(N, dtype=np.int16)
+    err = proto.write_data(ramp.astype(np.float64))
+    if err:
+        print(f"WRITE_DATA error: {err}")
+        proto.close()
+        sys.exit(1)
+    print("  done")
 
     # ── Start FFT ────────────────────────────────
     print("Starting FFT...")

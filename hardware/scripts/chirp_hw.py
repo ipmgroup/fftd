@@ -11,7 +11,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from hardware.scripts.fft_proto import FftProto
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from hardware.scripts.fft_proto import FftProto
+except ImportError:
+    from fft_proto import FftProto
 
 # Parameters
 N      = 1024

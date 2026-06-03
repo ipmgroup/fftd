@@ -2,7 +2,10 @@
 """bench_fft.py — FPGA vs CPU FFT benchmark (Raspberry Pi)"""
 import sys, time, subprocess, re, numpy as np
 sys.path.insert(0, '.')
-from hardware.scripts.fft_proto import FftProto, CMD_CONTROL, CTRL_START
+try:
+    from hardware.scripts.fft_proto import FftProto, CMD_CONTROL, CTRL_START
+except ImportError:
+    from fft_proto import FftProto, CMD_CONTROL, CTRL_START
 
 N=1024; RUNS=10; MAX_Q=32767
 ramp_f32=np.arange(N,dtype=np.float32); ramp_f64=np.arange(N,dtype=np.float64)
@@ -12,10 +15,18 @@ print("="*60)
 print("FPGA FFT (ICE40HX4K, 50 MHz, SPI 8 MHz, poll_ms=1)")
 print("="*60)
 
-proto=FftProto()  # uses default from fft_proto (12 MHz)
+proto=FftProto()
 f,_=proto.status()
 print(f"  Status: {f}")
 if f['busy']: proto.wait_done(timeout=5.0, poll_ms=1)
+
+# Preload ramp data
+print("  Preloading ramp 0..1023...")
+err = proto.write_data(np.arange(N, dtype=np.float64))
+if err:
+    print(f"  WRITE_DATA error: {err}")
+    sys.exit(1)
+print("  done")
 
 fft_t=[]; read_t=[]
 for r in range(RUNS):

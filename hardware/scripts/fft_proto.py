@@ -31,6 +31,29 @@ def checksum(cmd, length, seq):
     return cmd ^ length ^ seq
 
 
+def bit_reverse(idx, bits):
+    """Reverse the lower `bits` bits of integer `idx`."""
+    result = 0
+    for _ in range(bits):
+        result = (result << 1) | (idx & 1)
+        idx >>= 1
+    return result
+
+
+def bit_reverse_array(samples):
+    """Bit-reverse an array for DIT FFT input (N must be power of 2)."""
+    N = len(samples)
+    bits = N.bit_length() - 1
+    if (1 << bits) != N:
+        raise ValueError(f"N={N} is not a power of 2")
+    result = samples.copy() if hasattr(samples, 'copy') else list(samples)
+    for i in range(N):
+        j = bit_reverse(i, bits)
+        if i < j:
+            result[i], result[j] = result[j], result[i]
+    return result
+
+
 class FftProto:
     def __init__(self, bus=0, device=0, speed=SPI_SPEED):
         self.spi = spidev.SpiDev()
@@ -103,6 +126,11 @@ class FftProto:
                 return err
             time.sleep(0.01)  # 10ms gap — let FPGA settle
         return None
+
+    def write_data_bitrev(self, samples):
+        """Bit-reverse samples then write to FPGA BRAM (for DIT FFT)."""
+        bitrev_samples = bit_reverse_array(samples)
+        return self.write_data(bitrev_samples)
 
     def status(self):
         """Read STATUS register."""

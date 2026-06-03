@@ -7,10 +7,14 @@ HOST_CC      := gcc
 HOST_CFLAGS  := -Wall -O2 -g
 
 # Target: Raspberry Pi (ARM)
+# Use ARM_CROSS=arm-linux-gnueabihf- for 32-bit (armhf, Pi Zero/1/2/3)
+# Use ARM_CROSS=aarch64-linux-gnu-  for 64-bit (aarch64, Pi 3/4/5)
 TARGET_ARCH  := armhf
 ARM_CROSS    := arm-linux-gnueabihf-
+ARM_CROSS64  := aarch64-linux-gnu-
 ARM_CC       := $(ARM_CROSS)gcc
 ARM_CFLAGS   := -Wall -O2 -march=armv7-a -mfpu=neon
+ARM64_CFLAGS := -Wall -O2 -march=armv8-a
 
 # FPGA Target
 FPGA_DEVICE  := ice40hx4k
