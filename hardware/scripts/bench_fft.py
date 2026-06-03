@@ -36,11 +36,11 @@ for r in range(RUNS):
     dt_fft=time.perf_counter()-t0
     if not ok: continue
     t0=time.perf_counter()
-    bins,err=proto.read_all_bins(N,chunk=120)
+    bins,err=proto.read_all_bins(N,chunk=120,hermitian=True)
     dt_read=time.perf_counter()-t0
     if bins is None: continue
     fft_t.append(dt_fft); read_t.append(dt_read)
-    fpga_re=np.round(np.real(bins)*MAX_Q).astype(np.int64)
+    fpga_re=np.round(np.real(bins)).astype(np.int64)   # true FFT values (BFP-rescaled)
     print(f"  Run {r}: compute={dt_fft*1000:.2f}ms  read={dt_read*1000:.2f}ms  DC={fpga_re[0]}")
 proto.close()
 

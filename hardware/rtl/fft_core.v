@@ -21,7 +21,10 @@ module fft_core #(
     output reg                 busy,
     output reg                 frame_done,
     input  wire [N_LOG2-1:0]   ext_rd_addr,
-    output reg  [2*WIDTH-1:0]  ext_rd_data
+    output reg  [2*WIDTH-1:0]  ext_rd_data,
+    // Block-floating-point exponent: true value = output << bfp_exp.
+    // Valid once frame_done pulses; held until next FFT.
+    output reg  [3:0]          bfp_exp
 );
 
     localparam N     = 1 << N_LOG2;
@@ -42,7 +45,7 @@ module fft_core #(
     end
 
     // External read: reuse rd_a port when idle
-    wire [AW-1:0] bram_rd_a_fsm;
+    reg [AW-1:0] bram_rd_a_fsm;
     assign bram_rd_a = busy ? bram_rd_a_fsm : ext_rd_addr;
 
     always @(posedge clk) begin
@@ -97,12 +100,43 @@ module fft_core #(
     reg signed [WIDTH-1:0] acc0, acc1, acc2, acc3;
     reg [AW-1:0]           wr_upper, wr_lower;
 
-    wire signed [WIDTH-1:0] lw_re = acc0 - acc1;
-    wire signed [WIDTH-1:0] lw_im = acc2 + acc3;
-    wire signed [WIDTH-1:0] sum_re = u_re + lw_re;
-    wire signed [WIDTH-1:0] sum_im = u_im + lw_im;
-    wire signed [WIDTH-1:0] dif_re = u_re - lw_re;
-    wire signed [WIDTH-1:0] dif_im = u_im - lw_im;
+    // ── Block floating point (BFP) scaling ─────────────────────────
+    // Each radix-2 stage can grow magnitude up to 2x. We scale a stage's
+    // outputs by 1/2 whenever the previous stage produced a value that
+    // would overflow when doubled, counting the shift in bfp_exp
+    // (true value = stored << bfp_exp).
+    //
+    // "Would overflow when doubled" is detected cheaply: a signed value v
+    // needs scaling iff it does not fit in WIDTH-1 bits, i.e. v[15] ^ v[14].
+    // (No abs/compare chain — keeps the butterfly path short for timing.)
+    reg                    scale_stage;     // scale THIS pass's outputs by 1/2
+    reg                    risk;             // any output this pass needs scaling
+    reg                    load_risk;        // any input sample needs pass-0 scaling
+
+    wire signed [WIDTH:0] lw_re = $signed(acc0) - $signed(acc1);
+    wire signed [WIDTH:0] lw_im = $signed(acc2) + $signed(acc3);
+    // Full-precision butterfly (1 guard bit), then optional convergent /2.
+    wire signed [WIDTH+1:0] sum_re_f = $signed(u_re) + lw_re;
+    wire signed [WIDTH+1:0] sum_im_f = $signed(u_im) + lw_im;
+    wire signed [WIDTH+1:0] dif_re_f = $signed(u_re) - lw_re;
+    wire signed [WIDTH+1:0] dif_im_f = $signed(u_im) - lw_im;
+
+    // Round-half-to-even on the 1-bit right shift (no DC bias).
+    function signed [WIDTH-1:0] half_even;
+        input signed [WIDTH+1:0] v;
+        begin half_even = (v >>> 1) + (v[0] & v[1]); end
+    endfunction
+
+    wire signed [WIDTH-1:0] sum_re = scale_stage ? half_even(sum_re_f) : sum_re_f[WIDTH-1:0];
+    wire signed [WIDTH-1:0] sum_im = scale_stage ? half_even(sum_im_f) : sum_im_f[WIDTH-1:0];
+    wire signed [WIDTH-1:0] dif_re = scale_stage ? half_even(dif_re_f) : dif_re_f[WIDTH-1:0];
+    wire signed [WIDTH-1:0] dif_im = scale_stage ? half_even(dif_im_f) : dif_im_f[WIDTH-1:0];
+
+    // |v| >= 16384  ⟺  v doesn't fit in 15-bit signed  ⟺  v[WIDTH-1] ^ v[WIDTH-2]
+    function ovf_risk;
+        input signed [WIDTH-1:0] v;
+        begin ovf_risk = v[WIDTH-1] ^ v[WIDTH-2]; end
+    endfunction
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -118,6 +152,7 @@ module fft_core #(
             mul_o <= 0;
             {bram_rd_a_fsm, bram_rd_b, bram_wr} <= 0;
             bram_wdata <= 0;
+            scale_stage <= 0; risk <= 0; load_risk <= 0; bfp_exp <= 0;
         end else begin
             frame_done <= 0; dout_valid <= 0;
             bram_we <= 0;
@@ -125,14 +160,24 @@ module fft_core #(
             mul_o <= mul_a * mul_b + mul_c;
 
             case (state)
-                S_IDLE: if (start) begin state <= S_LOAD; idx <= 0; busy <= 1; end
+                S_IDLE: if (start) begin
+                    state <= S_LOAD; idx <= 0; busy <= 1;
+                    load_risk <= 0; risk <= 0; bfp_exp <= 0;
+                end
                 S_LOAD: if (din_valid) begin
                     bram_wr <= bit_reverse(idx); bram_wdata <= din; bram_we <= 1;
+                    // Flag if any input sample would overflow pass 0 when doubled.
+                    load_risk <= load_risk | ovf_risk(din[WIDTH-1:0])
+                                           | ovf_risk(din[2*WIDTH-1:WIDTH]);
                     if (idx == N - 1) state <= S_LOAD_DONE; else idx <= idx + 1;
                 end
                 S_LOAD_DONE: begin
                     bram_rd_a_fsm<=0; bram_rd_b<=1; pass<=0; bf_idx<=0;
                     upper<=0; lower<=1; step<=1; tw_cnt<=0; bf_in_group<=0;
+                    // Decide whether pass 0 needs scaling, start exponent.
+                    scale_stage <= load_risk;
+                    bfp_exp     <= load_risk ? 4'd1 : 4'd0;
+                    risk        <= 0;
                     state<=S_BF_RD;
                 end
                 S_BF_RD: begin wr_upper<=upper; wr_lower<=lower; state<=S_BF_M0; end
@@ -156,10 +201,12 @@ module fft_core #(
                 S_BF_M5: begin acc3<=mul_rnd>>>15; state<=S_BF_SUM; end
                 S_BF_SUM: begin
                     bram_wr<=wr_upper; bram_wdata<={sum_im,sum_re}; bram_we<=1;
+                    risk <= risk | ovf_risk(sum_re) | ovf_risk(sum_im);
                     state<=S_BF_WR;
                 end
                 S_BF_WR: begin
                     bram_wr<=wr_lower; bram_wdata<={dif_im,dif_re}; bram_we<=1;
+                    risk <= risk | ovf_risk(dif_re) | ovf_risk(dif_im);
                     state<=S_BF_WR2;
                 end
                 S_BF_WR2: begin
@@ -171,6 +218,10 @@ module fft_core #(
                             upper<=0; lower<=step<<1;
                             tw_cnt<=0; bf_in_group<=0;
                             bram_rd_a_fsm<=0; bram_rd_b<=step<<1;
+                            // BFP decision for next pass based on this pass's peak.
+                            scale_stage <= risk;
+                            if (risk) bfp_exp <= bfp_exp + 1'b1;
+                            risk <= 0;
                             state<=S_BF_RD;
                         end
                     end else begin

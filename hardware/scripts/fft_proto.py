@@ -10,7 +10,13 @@ import time
 import numpy as np
 
 N = 1024
-SPI_SPEED = 8000000  # Hz — tested stable at 50 MHz sysclk (6.25× oversampling)
+# Hz — reliable readout speed.
+#   Dual-clock firmware (SPI domain 87.5 MHz, FFT core 43.75 MHz): the 4-byte/
+#   bin complex response is stable up to 16 MHz SCK (verified: 0 fails, corr
+#   1.0). 17 MHz+ fails (Pi clock quantisation pushes it past the oversampling
+#   limit of the 87.5 MHz SPI domain).
+#   Single-clock firmware (50 MHz): use 8 MHz here instead.
+SPI_SPEED = 16000000
 
 # ── Protocol constants ──────────────────────────
 CMD_STATUS_REQ  = 0x60
@@ -145,6 +151,7 @@ class FftProto:
             'busy':      bool(status & 0x40),
             'done':      bool(status & 0x20),
             'error':     bool(status & 0x10),
+            'exp':       status & 0x0F,   # BFP exponent (true value = out << exp)
         }
         return flags, None
 
@@ -153,38 +160,71 @@ class FftProto:
         cmd, data, err = self._xfer_frame(CMD_CONTROL, bytes([code]))
         return err
 
-    def read_result(self, num_bins=64):
-        """Read FFT result bins (real part only, 2 bytes/bin)."""
+    # Max bins per frame: 4 bytes/bin and LEN is 8-bit (255) → 63.
+    MAX_BINS_PER_FRAME = 63
+
+    def read_result(self, num_bins=60):
+        """Read FFT result bins (complex, 4 bytes/bin: re_hi,re_lo,im_hi,im_lo).
+
+        Returns raw int16 complex values (still scaled by the BFP exponent).
+        """
+        if num_bins > self.MAX_BINS_PER_FRAME:
+            num_bins = self.MAX_BINS_PER_FRAME
         cmd, data, err = self._xfer_frame(
             CMD_READ_RESULT,
             bytes([num_bins]),
-            expected_len=num_bins * 2
+            expected_len=num_bins * 4
         )
         if err:
             return None, err
-        if len(data) < num_bins * 2:
-            return None, f"Got {len(data)} bytes, expected {num_bins * 2}"
+        if len(data) < num_bins * 4:
+            return None, f"Got {len(data)} bytes, expected {num_bins * 4}"
 
         bins = np.zeros(num_bins, dtype=complex)
         for i in range(num_bins):
-            hi = data[i * 2]
-            lo = data[i * 2 + 1]
-            val = (hi << 8) | lo
-            if val & 0x8000:
-                val = -((~val & 0xFFFF) + 1)
-            bins[i] = complex(val / 32767.0, 0.0)
+            re = (data[i * 4] << 8) | data[i * 4 + 1]
+            im = (data[i * 4 + 2] << 8) | data[i * 4 + 3]
+            if re & 0x8000:
+                re -= 0x10000
+            if im & 0x8000:
+                im -= 0x10000
+            bins[i] = complex(re, im)
         return bins, None
 
-    def read_all_bins(self, total=1024, chunk=60):
-        """Read all bins in chunks. Returns complex array."""
-        all_bins = np.zeros(total, dtype=complex)
-        for offset in range(0, total, chunk):
-            n = min(chunk, total - offset)
+    def read_all_bins(self, total=1024, chunk=60, rescale=True, hermitian=False):
+        """Read FFT bins in chunks. Returns true complex FFT values.
+
+        With rescale=True the raw int16 bins are multiplied by 2**bfp_exp
+        (read from STATUS) so the result matches numpy.fft.fft(int_samples).
+
+        With hermitian=True (valid only for real input) only the unique
+        N/2+1 bins are read over SPI and the upper half is reconstructed via
+        conjugate symmetry X[N-k] = conj(X[k]) — roughly halves readout time.
+        """
+        if chunk > self.MAX_BINS_PER_FRAME:
+            chunk = self.MAX_BINS_PER_FRAME
+        scale = 1.0
+        if rescale:
+            flags, err = self.status()
+            if not err:
+                scale = float(1 << flags['exp'])
+
+        n_read = (total // 2 + 1) if hermitian else total
+        bins_read = np.zeros(n_read, dtype=complex)
+        for offset in range(0, n_read, chunk):
+            n = min(chunk, n_read - offset)
             bins, err = self.read_result(n)
             if err:
                 return None, f"Chunk {offset}: {err}"
-            all_bins[offset:offset+n] = bins
-        return all_bins, None
+            bins_read[offset:offset+n] = bins
+
+        if hermitian:
+            all_bins = np.zeros(total, dtype=complex)
+            all_bins[:n_read] = bins_read
+            # X[N-k] = conj(X[k]) for k = 1 .. N/2-1
+            all_bins[n_read:] = np.conj(bins_read[1:total - n_read + 1][::-1])
+            return all_bins * scale, None
+        return bins_read * scale, None
 
     def wait_done(self, timeout=2.0, poll_ms=50):
         """Poll STATUS until done=1 or timeout."""

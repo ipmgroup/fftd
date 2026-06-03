@@ -69,60 +69,55 @@ def main():
         sys.exit(1)
     print(f"FFT done in {dt:.3f}s")
 
+    # ── BFP exponent (for tolerance scaling) ─────
+    flags2, _ = proto.status()
+    exp = flags2['exp'] if flags2 else 0
+
     # ── Read result ──────────────────────────────
     print(f"Reading {N} bins...")
     t0 = time.time()
-    bins, err = proto.read_all_bins(N)
+    bins, err = proto.read_all_bins(N)   # already rescaled by 2**exp
     dt_read = time.time() - t0
     if err:
         print(f"READ_RESULT error: {err}")
         proto.close()
         sys.exit(1)
-    print(f"Read {N} bins in {dt_read:.3f}s ({N/dt_read:.0f} bins/s)")
+    print(f"Read {N} bins in {dt_read:.3f}s ({N/dt_read:.0f} bins/s)  BFP exp={exp}")
 
     proto.close()
 
-    # ── Reference (ramp 0..N-1, imag=0) ──────────
-    # CRITICAL: FPGA uses Q1.15 — input values 0..1023 represent 0/32768..1023/32768.
-    # Numpy must use the SAME scale to compare.
-    ramp = np.arange(N, dtype=np.float64) / MAX_Q   # Q1.15 scale
-    ref = np.fft.fft(ramp)
+    # ── Reference: true FFT of the integer ramp 0..N-1 ──
+    ref = np.fft.fft(np.arange(N, dtype=np.float64))
 
-    # ── Compare ───────────────────────────────────
-    # FPGA: raw Q1.15 int → fft_proto divides by MAX_Q → multiply back
-    fpga_i16 = np.round(np.real(bins) * MAX_Q).astype(np.int64)
-    fpga_q16 = np.round(np.imag(bins) * MAX_Q).astype(np.int64)
+    fpga_re = np.round(np.real(bins)).astype(np.int64)
+    fpga_im = np.round(np.imag(bins)).astype(np.int64)
+    ref_re  = np.round(ref.real).astype(np.int64)
+    ref_im  = np.round(ref.imag).astype(np.int64)
 
-    # Reference: Q1.15 float → scale to int16 → wrap like FPGA
-    ref_i16_re = np.round(ref.real * MAX_Q).astype(np.int64)
-    ref_i16_im = np.round(ref.imag * MAX_Q).astype(np.int64)
-    ref_re_i16 = ref_i16_re & 0xFFFF
-    ref_im_i16 = ref_i16_im & 0xFFFF
-    ref_re_i16[ref_re_i16 >= 0x8000] -= 0x10000
-    ref_im_i16[ref_im_i16 >= 0x8000] -= 0x10000
+    d_re = np.abs(fpga_re - ref_re)
+    d_im = np.abs(fpga_im - ref_im)
 
-    d_re = np.abs(fpga_i16 - ref_re_i16)
-    d_im = np.abs(fpga_q16 - ref_im_i16)
+    # Each stored LSB equals 2**exp in true units → tolerance scales with it.
+    tol_lsb = 32
+    tol = tol_lsb * (1 << exp)
+    max_err = int(max(np.max(d_re), np.max(d_im)))
+    failed = int(np.sum((d_re > tol) | (d_im > tol)))
 
-    max_err = max(np.max(d_re), np.max(d_im))
-    tol = 32  # LSB for N=1024 (10 stages Q1.15 quantization)
-    failed = np.sum((d_re > tol) | (d_im > tol))
-
-    print(f"\n{'Bin':>6s}  {'FPGA re':>8s} {'FPGA im':>8s}  "
-          f"{'Ref re':>8s} {'Ref im':>8s}  {'dRe':>5s} {'dIm':>5s}")
-    print("-" * 65)
-    for i in range(min(N, 64)):
-        print(f"{i:6d}  {fpga_i16[i]:8d} {fpga_q16[i]:8d}  "
-              f"{ref_re_i16[i]:8d} {ref_im_i16[i]:8d}  "
-              f"{d_re[i]:5d} {d_im[i]:5d}")
-    if N > 64:
-        print(f"... ({N-64} more bins)")
+    print(f"\n{'Bin':>6s}  {'FPGA re':>10s} {'FPGA im':>10s}  "
+          f"{'Ref re':>10s} {'Ref im':>10s}  {'dRe':>7s} {'dIm':>7s}")
+    print("-" * 75)
+    for i in range(min(N, 16)):
+        print(f"{i:6d}  {fpga_re[i]:10d} {fpga_im[i]:10d}  "
+              f"{ref_re[i]:10d} {ref_im[i]:10d}  "
+              f"{d_re[i]:7d} {d_im[i]:7d}")
+    if N > 16:
+        print(f"... ({N-16} more bins)")
 
     ref_mag = np.abs(ref)
-    fpga_mag = np.sqrt(fpga_i16.astype(np.float64)**2 + fpga_q16.astype(np.float64)**2)
+    fpga_mag = np.abs(bins)
     corr = np.corrcoef(fpga_mag, ref_mag)[0, 1]
 
-    print(f"\nMax error : {max_err} LSB  (tolerance ±{tol})")
+    print(f"\nMax error : {max_err}  (tolerance ±{tol} = {tol_lsb} LSB << {exp})")
     print(f"Failed    : {failed}/{N} bins")
     print(f"Correlation |X|: {corr:.6f}")
 
@@ -131,7 +126,7 @@ def main():
         print(f"FFT time  : {dt:.3f}s")
         print(f"Read time : {dt_read:.3f}s")
         print(f"Total time: {dt + dt_read:.3f}s")
-        print(f"DC bin    : FPGA={fpga_i16[0]}, Ref={ref_re_i16[0]}")
+        print(f"DC bin    : FPGA={fpga_re[0]}, Ref={ref_re[0]}")
 
     if failed == 0:
         print(f"\n*** ALL {N} BINS PASS ***")

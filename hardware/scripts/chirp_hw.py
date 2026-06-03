@@ -66,7 +66,7 @@ print("  done")
 
 # Read result
 print("Reading result...")
-bins, err = proto.read_all_bins(N, chunk=120)
+bins, err = proto.read_all_bins(N, chunk=120, hermitian=True)
 if err:
     print(f"READ_RESULT error: {err}")
     sys.exit(1)

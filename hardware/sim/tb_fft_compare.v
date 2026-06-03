@@ -19,6 +19,7 @@ module tb_fft_compare;
     wire [31:0] dout;
     reg  [N_LOG2-1:0] ext_rd_addr;
     wire [31:0]       ext_rd_data;
+    wire [3:0]        bfp_exp;
 
     reg  [31:0] samples [0:N-1];
     reg  [31:0] results [0:N-1];
@@ -36,7 +37,8 @@ module tb_fft_compare;
         .busy        (busy),
         .frame_done  (frame_done),
         .ext_rd_addr (ext_rd_addr),
-        .ext_rd_data (ext_rd_data)
+        .ext_rd_data (ext_rd_data),
+        .bfp_exp     (bfp_exp)
     );
 
     always #5 clk = ~clk;
@@ -71,10 +73,12 @@ module tb_fft_compare;
             $finish;
         end
 
-        // read results via ext_rd_addr (1-cycle pipeline)
+        // read results via ext_rd_addr (2-cycle pipeline:
+        // addr→bram_rd_a→rd_a→ext_rd_data). Wait 3 edges before sampling.
         @(posedge clk);
         for (i=0; i<N; i=i+1) begin
             ext_rd_addr <= i[N_LOG2-1:0];
+            @(posedge clk);
             @(posedge clk);
             @(posedge clk);
             results[i] = ext_rd_data;
@@ -90,7 +94,12 @@ module tb_fft_compare;
             $fwrite(fd, "%08x\n", results[i]);
         $fclose(fd);
 
-        $display("OK: fft_output.hex written (%0d bins)", N);
+        // Write BFP exponent for the comparator to rescale the reference.
+        fd = $fopen("fft_exp.txt", "w");
+        $fwrite(fd, "%0d\n", bfp_exp);
+        $fclose(fd);
+
+        $display("OK: fft_output.hex written (%0d bins), bfp_exp=%0d", N, bfp_exp);
         $finish;
     end
 

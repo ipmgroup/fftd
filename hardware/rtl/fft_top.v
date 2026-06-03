@@ -49,32 +49,47 @@ module fft_top (
     localparam N      = 1024;
     localparam N_LOG2 = 10;
 
-    // ── PLL: 100 MHz → 50 MHz (multiplier safe, Fmax=72) ─
-    //   DIVR=0 (÷1) → Fref=100 MHz
-    //   DIVF=7 (×8) → Fvco=800 MHz (533-1066 ✓)
-    //   DIVQ=4 (÷16) → Fout=50 MHz
-    wire clk;
+    // ── PLL: 100 MHz → two phase-aligned clocks ──────────
+    //   clk_spi = 87.5 MHz (GENCLK)      → SPI sample domain
+    //   clk     = 43.75 MHz (GENCLK_HALF)→ FFT core domain
+    //   DIVR=0 → Fref=100; DIVF=6 → Fvco=700 (533-1066 ✓); DIVQ=3 (÷8) →
+    //   87.5 MHz on port A; port B = GENCLK_HALF = 43.75 MHz, edge-aligned.
+    //   87.5 MHz leaves ~8% margin under the SPI-domain Fmax (~95 MHz); 100 MHz
+    //   does not close reliably. SPI oversampling at 87.5 MHz → SCK up to ~22 MHz.
+    wire clk;       // 43.75 MHz core
+    wire clk_spi;   // 87.5 MHz SPI
 
-    SB_PLL40_PAD #(
+    SB_PLL40_2F_PAD #(
         .FEEDBACK_PATH("SIMPLE"),
         .DIVR(4'b0000),
-        .DIVF(7'b0000111),
-        .DIVQ(3'b100),
-        .FILTER_RANGE(3'b001)
+        .DIVF(7'b0000110),
+        .DIVQ(3'b011),
+        .FILTER_RANGE(3'b001),
+        .PLLOUT_SELECT_PORTA("GENCLK"),
+        .PLLOUT_SELECT_PORTB("GENCLK_HALF")
     ) pll_inst (
         .PACKAGEPIN    (clk_100mhz),
-        .PLLOUTGLOBAL  (clk),
+        .PLLOUTGLOBALA (clk_spi),
+        .PLLOUTGLOBALB (clk),
         .RESETB        (1'b1),
         .BYPASS        (1'b0)
     );
 
-    // ── Reset: 255 cycles ≈ 5 µs at 50 MHz ────
+    // ── Reset: 255 cycles in each domain ─────────────────
     reg [7:0] rst_cnt = 0;
     reg       rst_n = 0;
     reg       soft_rst = 0;
     always @(posedge clk) begin
         if (rst_cnt != 8'hFF) rst_cnt <= rst_cnt + 1;
         rst_n <= (rst_cnt == 8'hFF) && !soft_rst;
+    end
+
+    // SPI-domain reset (released after core reset is stable).
+    reg [7:0] rst_cnt_spi = 0;
+    reg       rst_n_spi   = 0;
+    always @(posedge clk_spi) begin
+        if (rst_cnt_spi != 8'hFF) rst_cnt_spi <= rst_cnt_spi + 1;
+        rst_n_spi <= (rst_cnt_spi == 8'hFF);
     end
 
     // ── SPI Protocol Slave ────────────────────────
@@ -89,8 +104,8 @@ module fft_top (
     reg         ext_resp_valid;
 
     spi_slave_proto spi_proto (
-        .clk            (clk),
-        .rst_n          (rst_n),
+        .clk            (clk_spi),
+        .rst_n          (rst_n_spi),
         .spi_sck        (spi_sck),
         .spi_mosi       (spi_mosi),
         .spi_miso       (spi_miso),
@@ -113,11 +128,45 @@ module fft_top (
         .in_tx_data     (in_tx_data)
     );
 
-    // ── Status register ───────────────────────────
+    // ── CDC: SPI domain (clk_spi) ⇄ core domain (clk) ─────
+    // SPI→core event pulses (cmd_valid / rx_data_valid / rx_frame_done) are
+    // 1-cycle@100 MHz — too narrow for the 50 MHz core to catch directly, so
+    // they go through toggle pulse-synchronisers. The associated data buses
+    // (cmd_byte, rx_data_byte) are registered in the SPI domain and held
+    // stable for many core cycles around the pulse, so they are sampled
+    // directly when the synchronised pulse fires.
+    wire cmd_valid_c, rx_data_valid_c, rx_frame_done_c;
+
+    pulse_sync u_cmd_valid_sync (
+        .src_clk(clk_spi), .src_pulse(cmd_valid),
+        .dst_clk(clk), .dst_rst_n(rst_n), .dst_pulse(cmd_valid_c));
+    pulse_sync u_rx_dv_sync (
+        .src_clk(clk_spi), .src_pulse(rx_data_valid),
+        .dst_clk(clk), .dst_rst_n(rst_n), .dst_pulse(rx_data_valid_c));
+    pulse_sync u_rx_fd_sync (
+        .src_clk(clk_spi), .src_pulse(rx_frame_done),
+        .dst_clk(clk), .dst_rst_n(rst_n), .dst_pulse(rx_frame_done_c));
+
+    // ── Status register (core domain, source) ─────
     wire fft_busy, fft_done;
+    wire [3:0] fft_bfp_exp;        // BFP exponent from fft_core (true = out << exp)
     wire fft_ready = !fft_busy && rst_n;
-    // Use drdy_r (latched) instead of fft_done (1-cycle pulse) for status
-    wire [7:0] status_byte = {fft_ready, fft_busy, drdy_r, 1'b0, 4'h0};
+    // Use drdy_r (latched) instead of fft_done (1-cycle pulse) for status.
+    // Low nibble carries the BFP exponent so the host can rescale results.
+    wire [7:0] status_byte = {fft_ready, fft_busy, drdy_r, 1'b0, fft_bfp_exp};
+
+    // core→SPI: status byte synchronised into the SPI domain. When `done`
+    // propagates, bfp_exp has been stable for many cycles, so no bit-skew
+    // hazard for the value the host rescales with.
+    wire [7:0] status_byte_spi;
+    ff2_sync #(.W(8)) u_status_sync (
+        .clk(clk_spi), .d(status_byte), .q(status_byte_spi));
+
+    // core→SPI: frame_done pulse to reset the readout bin pointer.
+    wire fft_done_spi;
+    pulse_sync u_done_sync (
+        .src_clk(clk), .src_pulse(fft_done),
+        .dst_clk(clk_spi), .dst_rst_n(rst_n_spi), .dst_pulse(fft_done_spi));
 
     // ── DRDY output (cleared after readout completes or FFT restarts) ──
     reg drdy_r;
@@ -141,7 +190,7 @@ module fft_top (
             soft_rst      <= 0;
         end else begin
             fft_start_cmd <= 0;
-            if (rx_frame_done && cmd_byte == 8'h50) begin
+            if (rx_frame_done_c && cmd_byte == 8'h50) begin
                 case (rx_data_byte)
                     8'h01: fft_start_cmd <= 1;
                     8'h04: soft_rst <= 1;
@@ -181,7 +230,7 @@ module fft_top (
             buf_raddr <= 0; buf_feeding <= 0; buf_din_valid <= 0;
         end else begin
             buf_we <= 0;
-            if (cmd_valid && cmd_byte == 8'h41) begin
+            if (cmd_valid_c && cmd_byte == 8'h41) begin
                 spi_data_mode <= 1; spi_byte_hi <= 0;
                 spi_wr_pending <= 0;
             end
@@ -189,7 +238,7 @@ module fft_top (
                 spi_data_mode <= 0; buf_feeding <= 0;
             end
             // SPI byte assembly → write pending
-            if (rx_data_valid && spi_data_mode && !fft_busy) begin
+            if (rx_data_valid_c && spi_data_mode && !fft_busy) begin
                 if (!spi_byte_hi) begin
                     spi_sample[15:8] <= rx_data_byte;
                     spi_byte_hi <= 1;
@@ -283,41 +332,58 @@ module fft_top (
         .busy       (fft_busy),
         .frame_done (fft_done),
         .ext_rd_addr(ext_rd_addr),
-        .ext_rd_data(ext_rd_data)
+        .ext_rd_data(ext_rd_data),
+        .bfp_exp    (fft_bfp_exp)
     );
 
-    // ── READ_RESULT data pump ─────────────────────
+    // ── READ_RESULT data pump (4 bytes/bin: re_hi,re_lo,im_hi,im_lo) ──
+    // The 4 bytes of the current bin are held in a shift register (tx_word)
+    // and the emitted byte is always tx_word[31:24] — a direct wire, no mux.
+    // The next bin is prefetched mid-word (rd_bin++ at byte 1), so when the
+    // word reloads at byte 3 the BRAM read data is already settled. This
+    // keeps the SPI transmit path short enough to sustain high SCK.
     reg [N_LOG2-1:0] rd_bin;
-    reg               rd_hi;       // 0=re[15:8], 1=re[7:0]
-    reg [31:0]        rd_data;
+    reg [1:0]         rd_byte_idx;  // 0=re_hi 1=re_lo 2=im_hi 3=im_lo
+    reg [31:0]        rd_data;      // {im[31:16], re[15:0]}
+    reg [31:0]        tx_word;      // {re_hi, re_lo, im_hi, im_lo}, MSB first
     reg               reading;
 
     assign ext_rd_addr = rd_bin;
 
-    always @(posedge clk) begin
-        rd_data <= ext_rd_data;   // 1 cycle after ext_rd_addr
+    // Bytes for the current bin, packed MSB-first.
+    wire [31:0] bin_word = {rd_data[15:0], rd_data[31:16]};
+
+    // Readout runs in the SPI clock domain (clk_spi). It drives the core BRAM
+    // read address (ext_rd_addr = rd_bin) and samples ext_rd_data — a CDC read
+    // that is safe because rd_bin is held stable for a full byte period and the
+    // next bin is prefetched 2 byte periods ahead (see the byte FSM below).
+    always @(posedge clk_spi) begin
+        rd_data <= ext_rd_data;   // settles a few clk_spi cycles after rd_bin
     end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rd_bin  <= 0;
-            rd_hi   <= 0;
-            reading <= 0;
+    always @(posedge clk_spi or negedge rst_n_spi) begin
+        if (!rst_n_spi) begin
+            rd_bin      <= 0;
+            rd_byte_idx <= 0;
+            reading     <= 0;
+            tx_word     <= 0;
         end else begin
-            if (fft_done) rd_bin <= 0;
+            if (fft_done_spi) rd_bin <= 0;
 
             if (cmd_valid && cmd_byte == 8'h21) begin
-                rd_hi   <= 0;
-                reading <= 1;
+                rd_byte_idx <= 0;
+                reading     <= 1;
+                tx_word     <= bin_word;   // load first bin (rd_data settled)
             end
 
             if (tx_rd && reading) begin
-                if (rd_hi) begin
-                    rd_bin <= rd_bin + 1;
-                    rd_hi  <= 0;
-                end else begin
-                    rd_hi <= 1;
-                end
+                case (rd_byte_idx)
+                    2'd0: begin rd_byte_idx <= 2'd1; tx_word <= {tx_word[23:0], 8'h00}; end
+                    2'd1: begin rd_byte_idx <= 2'd2; tx_word <= {tx_word[23:0], 8'h00};
+                                rd_bin <= rd_bin + 1; end  // prefetch next bin
+                    2'd2: begin rd_byte_idx <= 2'd3; tx_word <= {tx_word[23:0], 8'h00}; end
+                    2'd3: begin rd_byte_idx <= 2'd0; tx_word <= bin_word; end  // next bin ready
+                endcase
             end
 
             if (tx_done && reading)
@@ -325,27 +391,27 @@ module fft_top (
         end
     end
 
-    wire [7:0] rd_byte = rd_hi ? rd_data[7:0] : rd_data[15:8];
+    wire [7:0] rd_byte = tx_word[31:24];   // direct wire — no mux in TX path
 
-    // ── Response data mux ─────────────────────────
+    // ── Response data mux (SPI domain) ────────────
     always @(*) begin
-        tx_data_byte = status_byte;    // default: STATUS_REQ
+        tx_data_byte = status_byte_spi;    // default: STATUS_REQ (synced)
         if (cmd_byte == 8'h21)  tx_data_byte = rd_byte;
         if (cmd_byte == 8'h41)  tx_data_byte = cmd_len;
         if (cmd_error)          tx_data_byte = 8'h01;
     end
 
-    // ── Response length override (READ_RESULT) ────
+    // ── Response length override (READ_RESULT), SPI domain ──
     reg [7:0] num_bins_r;
-    always @(posedge clk) begin
+    always @(posedge clk_spi) begin
         if (rx_data_valid && cmd_byte == 8'h21)
             num_bins_r <= rx_data_byte;
     end
 
-    always @(posedge clk) begin
+    always @(posedge clk_spi) begin
         ext_resp_valid <= 0;
         if (in_gap && cmd_byte == 8'h21) begin
-            ext_resp_len   <= num_bins_r * 8'd2;  // 2 bytes/bin (re only)
+            ext_resp_len   <= num_bins_r * 8'd4;  // 4 bytes/bin (re + im)
             ext_resp_valid <= 1;
         end
     end
@@ -390,6 +456,46 @@ module fft_top (
         .sram_ub_n  (sram_ub_n)
     );
 
+endmodule
+
+//=============================================================================
+// CDC helpers
+//=============================================================================
+
+// Level/vector synchroniser (2 FF). For slowly-changing buses where a few
+// cycles of skew between bits is acceptable (e.g. status that is polled).
+module ff2_sync #(parameter W = 1) (
+    input  wire          clk,
+    input  wire [W-1:0]  d,
+    output reg  [W-1:0]  q
+);
+    reg [W-1:0] meta;
+    always @(posedge clk) begin
+        meta <= d;
+        q    <= meta;
+    end
+endmodule
+
+// Toggle-based pulse synchroniser. A 1-cycle pulse in the source domain
+// produces a 1-cycle pulse in the destination domain, regardless of clock
+// ratio/phase. `rst_n` is in the destination domain.
+module pulse_sync (
+    input  wire  src_clk,
+    input  wire  src_pulse,
+    input  wire  dst_clk,
+    input  wire  dst_rst_n,
+    output wire  dst_pulse
+);
+    reg tgl = 1'b0;
+    always @(posedge src_clk)
+        if (src_pulse) tgl <= ~tgl;
+
+    reg [2:0] sync;
+    always @(posedge dst_clk or negedge dst_rst_n)
+        if (!dst_rst_n) sync <= 3'b000;
+        else            sync <= {sync[1:0], tgl};
+
+    assign dst_pulse = sync[2] ^ sync[1];
 endmodule
 
 `default_nettype wire

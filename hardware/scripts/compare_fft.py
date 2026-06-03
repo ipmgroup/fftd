@@ -26,6 +26,7 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 SIM_DIR     = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'sim'))
 INPUT_HEX   = os.path.join(SIM_DIR, 'fft_input.hex')
 OUTPUT_HEX  = os.path.join(SIM_DIR, 'fft_output.hex')
+EXP_TXT     = os.path.join(SIM_DIR, 'fft_exp.txt')
 WORKSPACE   = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
 
 DOCKER_IMAGE = 'ice40-fft'
@@ -66,6 +67,15 @@ def write_input_hex(real_samples: np.ndarray, path: str):
         for r in real_samples:
             word = int(r) & 0xFFFF          # imag = 0
             f.write(f"{word:08x}\n")
+
+def read_bfp_exp(path: str) -> int:
+    """Read the block-floating-point exponent written by the testbench."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
 
 def read_output_hex(path: str) -> np.ndarray:
     """Read N 32-bit words {imag[15:0], real[15:0]} → complex array."""
@@ -258,8 +268,12 @@ def main():
     fpga = read_output_hex(OUTPUT_HEX)
     print(f'Read    : {OUTPUT_HEX} ({len(fpga)} bins)')
 
-    # --- numpy reference ---
-    ref = np.fft.fft(x.astype(np.float64))
+    # --- block-floating-point exponent (true value = fpga << exp) ---
+    exp = read_bfp_exp(EXP_TXT)
+    print(f'BFP exp : {exp}  (FPGA output scaled by 1/{1 << exp})')
+
+    # --- numpy reference, scaled to match the FPGA's BFP output ---
+    ref = np.fft.fft(x.astype(np.float64)) / float(1 << exp)
 
     # --- compare ---
     print()
