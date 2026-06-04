@@ -12,7 +12,8 @@ ramp_f32=np.arange(N,dtype=np.float32); ramp_f64=np.arange(N,dtype=np.float64)
 results={}
 
 print("="*60)
-print("FPGA FFT (ICE40HX4K, 50 MHz, SPI 8 MHz, poll_ms=1)")
+print("FPGA FFT (ICE40HX4K, dual-clock 87.5/43.75 MHz, SPI 14 MHz, poll_ms=1)")
+print("  readout: BULK_READ (0x23) streaming, Hermitian")
 print("="*60)
 
 proto=FftProto()
@@ -36,12 +37,24 @@ for r in range(RUNS):
     dt_fft=time.perf_counter()-t0
     if not ok: continue
     t0=time.perf_counter()
-    bins,err=proto.read_all_bins(N,chunk=120,hermitian=True)
+    bins,err=proto.bulk_read(N,hermitian=True)
     dt_read=time.perf_counter()-t0
     if bins is None: continue
     fft_t.append(dt_fft); read_t.append(dt_read)
     fpga_re=np.round(np.real(bins)).astype(np.int64)   # true FFT values (BFP-rescaled)
     print(f"  Run {r}: compute={dt_fft*1000:.2f}ms  read={dt_read*1000:.2f}ms  DC={fpga_re[0]}")
+
+# Pipelined throughput: kick next compute, then read previous frame from SRAM —
+# compute is hidden under the readout (SRAM double-buffer, B2).
+print("  Pipelined (START n+1 → read n → wait_done)...")
+proto.control(CTRL_START); proto.wait_done(timeout=5.0, poll_ms=1)   # prime frame 0
+pipe_t=[]
+for _ in range(RUNS):
+    t0=time.perf_counter()
+    proto.control(CTRL_START)
+    bins,err=proto.bulk_read(N,hermitian=True)
+    proto.wait_done(timeout=5.0, poll_ms=1)
+    pipe_t.append(time.perf_counter()-t0)
 proto.close()
 
 if fft_t:
@@ -49,6 +62,10 @@ if fft_t:
     results['FPGA readout']=np.mean(read_t)*1000
     results['FPGA total']=results['FPGA compute']+results['FPGA readout']
     print(f"  Avg: compute={results['FPGA compute']:.2f}ms  read={results['FPGA readout']:.2f}ms")
+    if pipe_t:
+        results['FPGA pipelined']=np.mean(pipe_t)*1000
+        print(f"  Pipelined: {results['FPGA pipelined']:.2f}ms/frame "
+              f"({1000.0/results['FPGA pipelined']:.0f} FFT/s)")
 else:
     results['FPGA compute']=1.08; results['FPGA readout']=3.80
     results['FPGA total']=4.88
@@ -85,7 +102,7 @@ print(f"  {'Method':<22s} {'Time':>10s}  {'vs FPGA':>10s}  {'vs numpy64':>10s}")
 print(f"  {'-'*22} {'-'*10}  {'-'*10}  {'-'*10}")
 base=np64=results.get('numpy float64',0.027)
 fpga_tot=results.get('FPGA total',4.88)
-for name in ['FPGA compute','FPGA readout','FPGA total','numpy float64','numpy float32','FFTW3 float32']:
+for name in ['FPGA compute','FPGA readout','FPGA total','FPGA pipelined','numpy float64','numpy float32','FFTW3 float32']:
     if name in results:
         ms=results[name]
         ts=f"{ms*1000:.0f} us" if ms<1 else f"{ms:.2f} ms"
