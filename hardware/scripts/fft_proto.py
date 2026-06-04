@@ -26,10 +26,11 @@ CMD_FFT_CONFIG  = 0x51
 CMD_WRITE_DATA  = 0x41
 CMD_READ_RESULT = 0x21
 CMD_CONTROL     = 0x50
-CMD_SRAM_WRITE  = 0x42
+CMD_SRAM_WRITE  = 0x42   # legacy single-word SRAM debug write (unused firmware)
 CMD_SRAM_READ   = 0x22
 CMD_SRAM_ADDR   = 0x52
 CMD_BULK_READ   = 0x23   # stream whole spectrum in one transaction
+CMD_WRITE_SRAM  = 0x43   # stage a full input frame into SRAM (input double-buffer)
 
 CTRL_START = 0x01
 CTRL_STOP  = 0x02
@@ -140,6 +141,36 @@ class FftProto:
         """Bit-reverse samples then write to FPGA BRAM (for DIT FFT)."""
         bitrev_samples = bit_reverse_array(samples)
         return self.write_data(bitrev_samples)
+
+    def write_data_sram(self, samples):
+        """Stage real-only int16 samples into external SRAM (WRITE_SRAM 0x43).
+
+        Unlike write_data (0x41, direct-to-BRAM, only while idle), this routes the
+        frame through SRAM. The on-chip scheduler writes each sample into the SRAM
+        input region; at the next CONTROL(START) an input-DMA copies the staged
+        frame SRAM→BRAM before the FFT runs. Because SRAM staging is independent
+        of the FFT core, this may be sent while the core is busy / a readout is in
+        flight, letting the host preload the next frame during compute/readout.
+
+        A full frame must be staged (the 10-bit write pointer wraps at 1024 so
+        consecutive ≤120-sample chunks accumulate into one aligned frame).
+        """
+        MAX_CHUNK = 120  # 240 bytes < 255 LEN limit
+        for offset in range(0, len(samples), MAX_CHUNK):
+            chunk = samples[offset:offset+MAX_CHUNK]
+            data_out = b''
+            for s in chunk:
+                v = int(s) & 0xFFFF
+                data_out += bytes([(v >> 8) & 0xFF, v & 0xFF])
+            _, _, err = self._xfer_frame(CMD_WRITE_SRAM, data_out)
+            if err:
+                return err
+            time.sleep(0.002)
+        return None
+
+    def write_data_sram_bitrev(self, samples):
+        """Bit-reverse samples then stage into SRAM (for DIT FFT)."""
+        return self.write_data_sram(bit_reverse_array(samples))
 
     def status(self):
         """Read STATUS register."""

@@ -1,12 +1,14 @@
 # SPI_PROTOCOL.md — Raspberry Pi ↔ ICE40HX4K FFT Engine
 
-**Version**: 1.3  
+**Version**: 1.4  
 **Date**: 2026-06-04  
 **Status**: Production Ready  
 **Update**: Complex (re+im) 4-byte/bin output with BFP exponent; dual-clock SPI
 domain (87.5 MHz) decoupled from the FFT core (43.75 MHz); BULK_READ (0x23)
 streaming readout; re-measured reliable ceiling 14 MHz SCK; SRAM double-buffer
-enabling compute/readout overlap (≈2× throughput)
+enabling compute/readout overlap (≈2× throughput); **WRITE_SRAM (0x43)
+SRAM-staged input** with input-DMA (host can preload the next frame during
+compute/readout — input double-buffering)
 
 ---
 
@@ -196,6 +198,38 @@ MISO: [0x41] [0x01] [SEQ] [CHECKSUM] [LEN]
 ```
 
 **Note**: Data is sent in chunks (max 252 bytes per frame). Address auto-increments across chunks.
+
+---
+
+### 3.3a WRITE_SRAM (0x43) — SRAM-Staged Input (input double-buffer)
+
+Same wire format as `WRITE_DATA` (0x41), but the frame is staged into the
+external SRAM input region instead of being written straight into the core's
+BRAM. At the next `CONTROL(START)` an on-chip **input-DMA** copies the staged
+frame SRAM→BRAM before the FFT runs.
+
+**Request** (send N samples × 16-bit, big-endian — identical to 0x41):
+```
+MOSI: [0x43] [LEN] [SEQ] [CHECKSUM] [S0_H] [S0_L] ... [SN_H] [SN_L]
+      CMD     LEN         (0x43^LEN^SEQ) (LEN bytes data)
+```
+
+**Why a separate command**: `WRITE_DATA` (0x41) writes the core BRAM directly
+and is therefore only legal while the core is idle. `WRITE_SRAM` is decoupled
+from the FFT core, so the host may stage the *next* frame **while the current
+frame is still computing or being read out** — i.e. input double-buffering on
+top of the existing output double-buffer (B2).
+
+**Notes**:
+- A *full* frame must be staged. The 10-bit write pointer wraps at 1024, so
+  consecutive ≤120-sample chunk transactions accumulate into one aligned frame.
+- Input writes are absorbed by a hardware FIFO that has priority over the
+  background output-DMA and is drained between output-DMA bins, so host samples
+  are **never dropped** even while a previous result is being copied to SRAM.
+- The FFT launch (`do_start`) is held until the input-DMA copy completes, so
+  the spectrum always reflects the freshly staged frame.
+
+**Response (ACK)**: same as `WRITE_DATA`.
 
 ---
 

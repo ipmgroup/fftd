@@ -10,7 +10,9 @@
 // SPI Commands:
 //   0x60 STATUS_REQ   → returns {ready,busy,done,error,4'h0}
 //   0x51 FFT_CONFIG    → ACK only (size/flags not used yet)
-//   0x41 WRITE_DATA    → ACK with byte count
+//   0x41 WRITE_DATA    → ACK with byte count (direct-to-BRAM input)
+//   0x43 WRITE_SRAM    → stage input frame into external SRAM (copied to BRAM
+//                        by an input-DMA at START; may be sent while busy)
 //   0x21 READ_RESULT   → returns N bins × 2 bytes (big-endian re[15:0])
 //   0x50 CONTROL       → START(0x01), STOP(0x02), RESET(0x04)
 //
@@ -185,7 +187,13 @@ module fft_top (
         end else begin
             if (dma_done)
                 drdy_r <= 1;       // result copied to SRAM → ready to read
-            if (feed_start)
+            // Clear on the START *request* (not feed_start): with SRAM-staged
+            // input the FFT only launches after the input-DMA (~1024 SRAM reads),
+            // so clearing at feed time would leave `done` asserted from the
+            // previous frame during that window — a host polling right after
+            // START would read the stale result. Clearing on fft_start_cmd drops
+            // `done` immediately and it is re-raised only by dma_done.
+            if (fft_start_cmd)
                 drdy_r <= 0;
         end
     end
@@ -218,13 +226,23 @@ module fft_top (
     reg [N_LOG2-1:0]  buf_raddr;
     reg [15:0]        buf_rdata;
 
+    // Input-DMA (SRAM input region → data_buf) write port. Declared here so the
+    // BRAM write mux below can see it; driven by the SRAM scheduler.
+    reg               idma_we;
+    reg [N_LOG2-1:0]  idma_waddr;
+    reg [15:0]        idma_wdata;
+
+    // data_buf write mux: the input-DMA (SRAM-staged input, 0x42) takes priority
+    // over the direct SPI write (0x41). The two paths are never active together.
     always @(posedge clk) begin
-        if (buf_we) data_buf[buf_waddr] <= buf_wdata;
+        if (idma_we)     data_buf[idma_waddr] <= idma_wdata;
+        else if (buf_we) data_buf[buf_waddr]  <= buf_wdata;
         buf_rdata <= data_buf[buf_raddr];
     end
 
     // ── SPI data mode + buffer write ──────────────
     reg        spi_data_mode;
+    reg        sram_in;          // 0x42: input staged into SRAM (not BRAM)
     reg        spi_byte_hi;
     reg [15:0] spi_sample;
     reg [N_LOG2-1:0] spi_wr_addr;
@@ -232,22 +250,58 @@ module fft_top (
     reg        buf_din_valid;
     reg        spi_wr_pending;  // delay write 1 cycle for spi_sample to settle
 
+    // SPI→scheduler input-write handshake (both in core domain). When a 16-bit
+    // sample is assembled in SRAM-input mode (0x42), post it for the scheduler to
+    // write into the SRAM input region. Sample period (~50 core cycles) ≫ SRAM
+    // write latency (6 cycles), so a single-entry handshake never overruns.
+    reg        iwr_set;
+    reg [15:0] iwr_data_r;
+    reg [N_LOG2-1:0] iwr_addr_r;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            spi_data_mode <= 0; spi_byte_hi <= 0; spi_sample <= 0;
+            spi_data_mode <= 0; sram_in <= 0; spi_byte_hi <= 0; spi_sample <= 0;
             spi_wr_addr <= 0; buf_we <= 0; spi_wr_pending <= 0;
             buf_raddr <= 0; buf_feeding <= 0; buf_din_valid <= 0;
+            iwr_set <= 0; iwr_data_r <= 0; iwr_addr_r <= 0;
         end else begin
-            buf_we <= 0;
+            buf_we  <= 0;
+            iwr_set <= 0;
+            // 0x41: legacy direct-to-BRAM input. 0x43: SRAM-staged input.
+            // spi_wr_addr is NOT reset per command: a full frame is sent as
+            // several ≤120-sample chunk transactions and the 10-bit address wraps
+            // at 1024, so consecutive chunks accumulate into one aligned frame.
             if (cmd_valid_c && cmd_byte == 8'h41) begin
-                spi_data_mode <= 1; spi_byte_hi <= 0;
+                spi_data_mode <= 1; sram_in <= 0; spi_byte_hi <= 0;
                 spi_wr_pending <= 0;
             end
+            if (cmd_valid_c && cmd_byte == 8'h43) begin
+                sram_in <= 1; spi_byte_hi <= 0;
+            end
+            // START in SRAM-input mode feeds the (input-DMA-filled) BRAM.
+            if (fft_start_cmd && sram_in)
+                spi_data_mode <= 1;
             if (fft_done) begin
                 spi_data_mode <= 0; buf_feeding <= 0;
             end
-            // SPI byte assembly → write pending
-            if (rx_data_valid_c && spi_data_mode && !fft_busy) begin
+            // SPI byte assembly. 0x43 posts samples to the scheduler for SRAM
+            // staging (allowed any time, incl. during compute/readout, so the
+            // host can preload while the core is busy). 0x41 writes BRAM directly
+            // and only while idle. Gating on cmd_byte prevents the dummy MOSI
+            // bytes of a read transaction (0x21/0x23) from being mistaken for
+            // input samples.
+            if (rx_data_valid_c && cmd_byte == 8'h43) begin
+                if (!spi_byte_hi) begin
+                    spi_sample[15:8] <= rx_data_byte;
+                    spi_byte_hi <= 1;
+                end else begin
+                    spi_byte_hi <= 0;
+                    iwr_data_r  <= {spi_sample[15:8], rx_data_byte};
+                    iwr_addr_r  <= spi_wr_addr;
+                    iwr_set     <= 1;
+                    spi_wr_addr <= spi_wr_addr + 1;
+                end
+            end else if (rx_data_valid_c && cmd_byte == 8'h41 && !fft_busy) begin
                 if (!spi_byte_hi) begin
                     spi_sample[15:8] <= rx_data_byte;
                     spi_byte_hi <= 1;
@@ -257,7 +311,7 @@ module fft_top (
                     spi_wr_pending <= 1;  // write next cycle when spi_sample settled
                 end
             end
-            // Delayed write: spi_sample is now fully updated
+            // Delayed write (0x41 path): spi_sample is now fully updated
             if (spi_wr_pending) begin
                 spi_wr_pending <= 0;
                 buf_waddr <= spi_wr_addr;
@@ -319,6 +373,13 @@ module fft_top (
     wire dma_idle = !dma_active && !dma_pending;
     wire free_run = !drdy_r && !result_in_sram;   // self-test FFT, only pre-first-result
 
+    // SRAM-staged input (0x42): a START first triggers an input-DMA copy of the
+    // staged frame from SRAM into the BRAM the FFT feeds from. The FFT launch is
+    // held until that copy finishes (input_ready). `input_dma_pending`/
+    // `input_ready` live in the scheduler; `input_dma_req` arms the copy.
+    wire input_dma_req = fft_start_cmd && sram_in;
+    wire input_ok      = !sram_in || input_ready;
+
     reg start_pending;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) start_pending <= 0;
@@ -328,7 +389,8 @@ module fft_top (
         end
     end
 
-    wire do_start = !fft_busy && !fft_done && dma_idle && (start_pending || free_run);
+    wire do_start = !fft_busy && !fft_done && dma_idle && input_ok
+                    && (start_pending || free_run);
     wire feed_start = fft_start_r;
 
     reg fft_start_r;
@@ -509,18 +571,49 @@ module fft_top (
     reg  [31:0]      sram_rd_word_r; // current bin word for the SPI readout
     reg  [2:0]       brwait;
 
+    // Input path (SRAM-staged, 0x43): host-write FIFO + input-DMA state.
+    //
+    // Host input samples (0x43) are pushed by the SPI assembly block (`iwr_set`)
+    // and drained by this scheduler into the SRAM input region. A single-entry
+    // handshake is NOT enough: when the scheduler is busy with a multi-thousand-
+    // cycle output-DMA (BRAM→SRAM copy of the previous result), it cannot service
+    // input writes for a long time, so back-to-back samples would overrun and be
+    // silently dropped (leaving X holes in the staged frame). A small FIFO plus
+    // a drain step inside the output-DMA loop (see SC_DMA_NEXT) absorbs the burst.
+    // Pointers carry an extra wrap bit so empty/full need no separate counter
+    // (and thus no simultaneous push/pop update hazard).
+    localparam IWR_DEPTH = 16, IWR_AW = 4;
+    reg [15:0]        iwr_fifo_data [0:IWR_DEPTH-1];
+    reg [N_LOG2-1:0]  iwr_fifo_addr [0:IWR_DEPTH-1];
+    reg [IWR_AW:0]    iwr_wptr, iwr_rptr;  // {wrap, index}
+    wire              iwr_empty = (iwr_wptr == iwr_rptr);
+    wire              iwr_full  = (iwr_wptr[IWR_AW-1:0] == iwr_rptr[IWR_AW-1:0])
+                                && (iwr_wptr[IWR_AW] != iwr_rptr[IWR_AW]);
+    reg              input_dma_pending; // a START armed an input copy
+    reg              input_ready;       // staged frame copied SRAM→BRAM
+    reg [N_LOG2-1:0] idma_i;            // current input sample being copied
+    reg [3:0]        iwr_ret;           // SC_IWR_WAIT return state
+
+    // SRAM byte-address base for the input staging region. The 32-bit output
+    // result occupies SRAM words 0..2047 (bins 0..1023 × 2 words); the input
+    // region starts well past it at byte 8192 (word 4096).
+    localparam [18:0] IN_BASE = 19'd8192;
+
     assign ext_rd_addr  = dma_addr;
     assign dma_done     = dma_done_r;
     assign sram_exp     = sram_exp_r;
     assign sram_rd_word = sram_rd_word_r;
 
-    localparam SC_RD_REQ  = 3'd0,
-               SC_RD_WAIT = 3'd1,
-               SC_DMA_SET = 3'd2,
-               SC_DMA_WAIT= 3'd3,
-               SC_DMA_WR  = 3'd4,
-               SC_DMA_NEXT= 3'd5;
-    reg [2:0] sched;
+    localparam SC_RD_REQ   = 3'd0,
+               SC_RD_WAIT  = 3'd1,
+               SC_DMA_SET  = 3'd2,
+               SC_DMA_WAIT = 3'd3,
+               SC_DMA_WR   = 3'd4,
+               SC_DMA_NEXT = 3'd5,
+               SC_IWR_WAIT = 3'd6,  // input-write to SRAM in flight
+               SC_IDMA_RD  = 3'd7;  // input-DMA: SRAM read → BRAM write
+    reg [3:0] sched;
+    reg       idma_phase;  // 0 = issue read, 1 = wait rvalid / next
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -528,20 +621,51 @@ module fft_top (
             dma_addr <= 0; dma_i <= 0; dma_active <= 0; dma_done_r <= 0;
             dma_pending <= 0; result_in_sram <= 0; sram_exp_r <= 0;
             sram_rd_word_r <= 0; brwait <= 0; sched <= SC_RD_REQ;
+            input_dma_pending <= 0; input_ready <= 0;
+            iwr_wptr <= 0; iwr_rptr <= 0; iwr_ret <= SC_RD_REQ;
+            idma_i <= 0; idma_we <= 0; idma_waddr <= 0; idma_wdata <= 0;
+            idma_phase <= 0;
         end else begin
             sram_req   <= 0;   // default: pulse req for one cycle
             dma_done_r <= 0;
+            idma_we    <= 0;   // default: pulse BRAM write for one cycle
 
             // A finished FFT frame schedules a BRAM→SRAM copy.
-            if (fft_done) dma_pending <= 1;
+            if (fft_done)      dma_pending       <= 1;
+            // A START in SRAM-input mode arms the input copy.
+            if (input_dma_req) input_dma_pending <= 1;
+            // Consumed once the feed begins; re-armed by the next START.
+            if (feed_start)    input_ready       <= 0;
+
+            // ── Input-write FIFO push (host 0x43 sample). Pops happen in the
+            // case below (independent rptr), so push/pop never collide.
+            if (iwr_set && !iwr_full) begin
+                iwr_fifo_data[iwr_wptr[IWR_AW-1:0]] <= iwr_data_r;
+                iwr_fifo_addr[iwr_wptr[IWR_AW-1:0]] <= iwr_addr_r;
+                iwr_wptr <= iwr_wptr + 1'b1;
+            end
 
             case (sched)
-                // ── Read-server: keep sram_rd_word fresh for rd_bin_c ──
+                // ── Dispatcher / read-server: keep sram_rd_word fresh ──
                 SC_RD_REQ: begin
-                    // Start the copy only when no SPI read is in flight, so the
-                    // host can keep streaming the previous frame from SRAM while
-                    // the next frame computes; the copy runs once the read ends.
-                    if (dma_pending && !reading_c) begin
+                    // Priority: host input write (must never drop) > input copy
+                    // > output copy (background, when no read in flight) >
+                    // read-server refresh. Input writes outrank the output-DMA so
+                    // the staged frame is complete before the input-DMA reads it.
+                    if (!iwr_empty) begin
+                        iwr_rptr    <= iwr_rptr + 1'b1;
+                        sram_req    <= 1;
+                        sram_wr     <= 1;
+                        sram_addr   <= IN_BASE + {iwr_fifo_addr[iwr_rptr[IWR_AW-1:0]], 2'b00};
+                        sram_wdata  <= {16'd0, iwr_fifo_data[iwr_rptr[IWR_AW-1:0]]};
+                        iwr_ret     <= SC_RD_REQ;
+                        sched       <= SC_IWR_WAIT;
+                    end else if (input_dma_pending) begin
+                        input_dma_pending <= 0;
+                        idma_i     <= 0;
+                        idma_phase <= 0;
+                        sched      <= SC_IDMA_RD;
+                    end else if (dma_pending && !reading_c) begin
                         dma_pending <= 0;
                         dma_active  <= 1;
                         dma_i       <= 0;
@@ -557,6 +681,33 @@ module fft_top (
                     if (sram_rvalid) begin
                         sram_rd_word_r <= sram_rdata;
                         sched <= SC_RD_REQ;
+                    end
+                end
+
+                // ── Host input write → SRAM input region. Returns to iwr_ret so
+                // it can be invoked both from the dispatcher and mid output-DMA. ──
+                SC_IWR_WAIT: begin
+                    if (sram_done) sched <= iwr_ret;
+                end
+
+                // ── Input-DMA: copy SRAM[IN_BASE+i] → data_buf[i] ──
+                SC_IDMA_RD: begin
+                    if (!idma_phase) begin
+                        sram_req   <= 1;
+                        sram_wr    <= 0;
+                        sram_addr  <= IN_BASE + {idma_i, 2'b00};
+                        idma_phase <= 1;
+                    end else if (sram_rvalid) begin
+                        idma_we    <= 1;
+                        idma_waddr <= idma_i;
+                        idma_wdata <= sram_rdata[15:0];
+                        idma_phase <= 0;
+                        if (idma_i == N-1) begin
+                            input_ready <= 1;
+                            sched       <= SC_RD_REQ;
+                        end else begin
+                            idma_i <= idma_i + 1;
+                        end
                     end
                 end
 
@@ -580,7 +731,20 @@ module fft_top (
                     if (sram_done) sched <= SC_DMA_NEXT;
                 end
                 SC_DMA_NEXT: begin
-                    if (dma_i == N-1) begin
+                    // Drain any pending host input writes before the next bin so
+                    // a long output-DMA can never starve (and thus drop) staged
+                    // 0x43 samples. SRAM write (~6 cyc) is faster than the SPI
+                    // sample period, so the FIFO stays shallow; we service one per
+                    // bin boundary and re-check here until empty.
+                    if (!iwr_empty) begin
+                        iwr_rptr   <= iwr_rptr + 1'b1;
+                        sram_req   <= 1;
+                        sram_wr    <= 1;
+                        sram_addr  <= IN_BASE + {iwr_fifo_addr[iwr_rptr[IWR_AW-1:0]], 2'b00};
+                        sram_wdata <= {16'd0, iwr_fifo_data[iwr_rptr[IWR_AW-1:0]]};
+                        iwr_ret    <= SC_DMA_NEXT;
+                        sched      <= SC_IWR_WAIT;
+                    end else if (dma_i == N-1) begin
                         dma_active     <= 0;
                         dma_done_r     <= 1;
                         result_in_sram <= 1;

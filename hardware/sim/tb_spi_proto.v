@@ -63,6 +63,22 @@ module tb_spi_proto;
     // ── 100 MHz clock ─────────────────────────────
     always #5 clk = ~clk;
 
+    // ── Event counters (debug) ────────────────────
+    integer dostart_cnt=0, fftbusy_cnt=0, fftdone_cnt=0, dmadone_cnt=0, feed_cnt=0;
+    reg pbusy=0; integer trace_on=0;
+    always @(posedge dut.clk) begin
+        if (dut.do_start)  dostart_cnt = dostart_cnt + 1;
+        if (dut.fft_done)  fftdone_cnt = fftdone_cnt + 1;
+        if (dut.dma_done)  dmadone_cnt = dmadone_cnt + 1;
+        if (trace_on && dut.din_valid && dut.din_ready) feed_cnt = feed_cnt + 1;
+        pbusy <= dut.fft_busy;
+        if (trace_on && dut.fft_busy && !pbusy)
+            $display("    [trace] t=%0t FFT START spi_data_mode=%b din=%05h data_buf0=%04h free_run=%b sram_in=%b start_pending=%b",
+                $time, dut.spi_data_mode, dut.din, dut.data_buf[0], dut.free_run, dut.sram_in, dut.start_pending);
+        if (trace_on && dut.fft_done)
+            $display("    [trace] t=%0t FFT DONE bfp_exp=%0d", $time, dut.fft_bfp_exp);
+    end
+
     // ── Test state ────────────────────────────────
     integer   test_pass, test_fail;
     reg [7:0] tx_buf [0:511];   // max 512-byte transaction
@@ -326,6 +342,101 @@ module tb_spi_proto;
         end
     endtask
 
+    // ── WRITE_SRAM (0x43): stage a frame into SRAM, FFT from the SRAM-staged
+    // input, verify the spectrum. Uses a DC frame (every sample = 0x0100): the
+    // FFT of a constant is a single non-zero bin (bin0 = N·C, all others 0).
+    // This is a strong discriminator — the BRAM the core feeds from is otherwise
+    // left holding a ramp (free-run / 0x41), whose spectrum is non-zero in every
+    // bin. So bin0≠0 with bins1..5≈0 can only happen if the input-DMA actually
+    // delivered the SRAM-staged DC frame into the core's input BRAM.
+    task test_write_sram;
+        integer ci, s, nsamp, total, i;
+        reg [7:0] seqn;
+        reg [15:0] re, im, re0, im0;
+        integer b, timeout;
+        reg ok, others_zero;
+        begin
+            $display("[TEST] WRITE_SRAM (0x43): stage DC frame, FFT via SRAM input...");
+            seqn = 8'd20;
+            dostart_cnt=0; fftdone_cnt=0; dmadone_cnt=0; feed_cnt=0; trace_on=1;
+            // Stage 1024 samples (all = 0x0100) in 120-sample chunks.
+            for (ci = 0; ci < 1024; ci = ci + 120) begin
+                nsamp = (1024 - ci > 120) ? 120 : (1024 - ci);
+                tx_buf[0] = 8'h43;
+                tx_buf[1] = nsamp * 2;
+                tx_buf[2] = seqn;
+                tx_buf[3] = xsum(8'h43, nsamp * 2, seqn);
+                for (s = 0; s < nsamp; s = s + 1) begin
+                    tx_buf[4 + s*2]     = 8'h01;             // sample = 0x0100
+                    tx_buf[4 + s*2 + 1] = 8'h00;
+                end
+                tx_buf[4 + nsamp*2] = 8'h00;                 // gap
+                for (i = 0; i < 4; i = i + 1)
+                    tx_buf[4 + nsamp*2 + 1 + i] = 8'h00;     // resp header dummies
+                total = 4 + nsamp*2 + 1 + 4;
+                spi_xfer(total);
+                seqn = seqn + 1;
+            end
+
+            $display("    [dbg] staged: spi_wr_addr=%0d sram_in=%b mem[4096]=%04h mem[6142]=%04h",
+                     dut.spi_wr_addr, dut.sram_in, u_sram.mem[4096], u_sram.mem[6142]);
+
+            // CONTROL START → triggers input-DMA (SRAM→BRAM) then FFT.
+            tx_buf[0] = 8'h50; tx_buf[1] = 8'd1; tx_buf[2] = seqn;
+            tx_buf[3] = xsum(8'h50, 8'd1, seqn);
+            tx_buf[4] = 8'h01;                                // CTRL_START
+            for (i = 5; i < 10; i = i + 1) tx_buf[i] = 8'h00; // gap + resp hdr
+            spi_xfer(10);
+            seqn = seqn + 1;
+
+            // Poll STATUS until done.
+            ok = 0; timeout = 0;
+            while (timeout < 12000 && !ok) begin
+                tx_buf[0] = 8'h60; tx_buf[1] = 8'd0; tx_buf[2] = seqn;
+                tx_buf[3] = xsum(8'h60, 8'd0, seqn);
+                for (i = 4; i < 10; i = i + 1) tx_buf[i] = 8'h00;
+                spi_xfer(10);
+                if (rx_buf[9][5]) ok = 1;                     // done bit
+                timeout = timeout + 1;
+                #2000;
+            end
+            seqn = seqn + 1;
+            $display("    [dbg] after wait: ok=%0d db[0]=%04h [1]=%04h [2]=%04h [512]=%04h [1023]=%04h sram_exp=%0d drdy=%b polls=%0d",
+                     ok, dut.data_buf[0], dut.data_buf[1], dut.data_buf[2], dut.data_buf[512],
+                     dut.data_buf[1023], dut.sram_exp, drdy, timeout);
+            $display("    [dbg] counts: do_start=%0d fft_done=%0d dma_done=%0d busy=%b feed_cnt=%0d buf_raddr=%0d",
+                     dostart_cnt, fftdone_cnt, dmadone_cnt, dut.fft_busy, feed_cnt, dut.buf_raddr);
+            if (!ok) begin
+                $display("  FAIL: FFT (SRAM input) timeout");
+                test_fail = test_fail + 1;
+            end else begin
+                // BULK_READ 6 bins: expect bin0 ≠ 0, bins 1..5 == 0 (DC spectrum).
+                total = 9 + 6*4;
+                tx_buf[0] = 8'h23; tx_buf[1] = 8'd0; tx_buf[2] = seqn;
+                tx_buf[3] = xsum(8'h23, 8'd0, seqn);
+                for (i = 4; i < total; i = i + 1) tx_buf[i] = 8'h00;
+                spi_xfer(total);
+                re0 = {rx_buf[9],  rx_buf[10]};
+                im0 = {rx_buf[11], rx_buf[12]};
+                others_zero = 1;
+                for (b = 0; b < 6; b = b + 1) begin
+                    re = {rx_buf[9 + b*4 + 0], rx_buf[9 + b*4 + 1]};
+                    im = {rx_buf[9 + b*4 + 2], rx_buf[9 + b*4 + 3]};
+                    $display("    bin[%0d] re=0x%04h im=0x%04h", b, re, im);
+                    if (b > 0 && (re != 16'h0000 || im != 16'h0000)) others_zero = 0;
+                end
+                if ((re0 != 16'h0000 || im0 != 16'h0000) && others_zero) begin
+                    $display("  PASS: SRAM-staged DC → bin0=0x%04h, bins1..5 zero", re0);
+                    test_pass = test_pass + 1;
+                end else begin
+                    $display("  FAIL: not a DC spectrum (bin0 re=0x%04h im=0x%04h, others_zero=%0d)",
+                             re0, im0, others_zero);
+                    test_fail = test_fail + 1;
+                end
+            end
+        end
+    endtask
+
     task test_bad_checksum;
         integer total, i, off;
         reg [7:0] h0, h1, h2, h3;
@@ -380,6 +491,7 @@ module tb_spi_proto;
         test_read(6'd8);
         test_read(6'd63);
         test_bulk_read(8);
+        test_write_sram();
         test_bad_checksum();
 
         $display("");
@@ -389,7 +501,7 @@ module tb_spi_proto;
 
         if (test_fail > 0) begin
             $display("SOME TESTS FAILED!");
-            $stop;
+            $finish;
         end else begin
             $display("ALL TESTS PASSED!");
             $finish;
@@ -398,9 +510,9 @@ module tb_spi_proto;
 
     // Watchdog
     initial begin
-        #30000000;
+        #60000000;
         $display("TIMEOUT");
-        $stop;
+        $finish;
     end
 
 endmodule

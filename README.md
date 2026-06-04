@@ -11,8 +11,9 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 - **FFT size**: 1024-point Radix-2 DIT (configurable via parameter)
 - **Data width**: 16-bit Q1.15 fixed-point; **complex (re+im) output** with a
   block-floating-point (BFP) exponent for full dynamic range
-- **Accuracy**: BFP + convergent rounding — ramp input correlates 1.000000 with
-  NumPy (0/1024 bins fail), chirp 0.999988
+- **Accuracy**: BFP + convergent rounding — DC/ramp/sin correlate 1.000000 with
+  NumPy, chirp 0.999987 (measured on hardware via both the BRAM `0x41` and the
+  SRAM-staged `0x43` input paths)
 - **Clocking**: dual-clock — SPI domain **87.5 MHz**, FFT core **43.75 MHz**
   (single `SB_PLL40_2F_PAD`, CDC across the boundary)
 - **SPI Protocol**: XOR-checksum framing, reliable up to **14 MHz SCK**
@@ -21,6 +22,10 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 - **SRAM double-buffer**: each result is copied to external AS6C4008 SRAM, so the
   host streams frame *N* while the core already computes frame *N+1*. Pipelined
   host loop → **2.0× throughput** (~500 FFT/s vs ~246, measured).
+- **SRAM-staged input** (`WRITE_SRAM` 0x43): the host can preload the *next* input
+  frame into SRAM while the core is busy/being read out (input double-buffer). A
+  priority FIFO + input-DMA guarantee no host samples are dropped even during the
+  background output copy. Bit-exact with the direct (0x41) path on hardware.
 - **Latency** (N=1024): ~1.1 ms compute + ~1.8 ms readout (Hermitian bulk, 14 MHz
   SCK); with overlap the steady-state cost is **~2.0 ms/frame** (compute hidden).
 
@@ -141,6 +146,29 @@ than a faster clock.
 - **Power**: ~0.2 W (FPGA) vs ~5 W (CPU core under FFT load)
 - **Larger N**: CPU cache misses increase at N > 4096, FPGA scales linearly
 - **Continuous DSP**: FPGA does FFT while CPU is free for other tasks
+
+## Verification
+
+Last full run (2026-06-04) — all suites green:
+
+| Suite | What | Result |
+|-------|------|--------|
+| RTL sim — `hardware/sim/tb_spi_proto.v` | STATUS/CONFIG/START/READ_RESULT/BULK_READ/**WRITE_SRAM**/checksum | **11/11 passed** |
+| RTL sim — `hardware/scripts/chirp_sim_sram.py` | chirp through the full SPI→SRAM→FFT→SRAM→readout path | corr **0.999970** vs numpy |
+| HW functional — `hardware/scripts/hw_test_signals.py` | DC / ramp / sin / chirp via **both** BRAM (0x41) & SRAM (0x43) | DC/ramp/sin **1.000000**, chirp **0.999987** — all PASS |
+| HW perf — `bench_fft.py` | compute / readout / pipelined throughput | 2.23 ms compute, 1.81 ms readout, **364 FFT/s** pipelined |
+| HW perf — `bench_pipeline.py` | compute/readout overlap | serial 4.07 → pipelined **2.00 ms/frame**, **2.03×**, 30/30 correct |
+| HW perf — `bench_bulk.py` | chunked vs bulk readout | bit-exact, bulk 1.80 ms vs chunked 2.30 ms (**1.28×**) |
+
+```bash
+# RTL functional suite (Docker)
+docker compose run --rm dev bash -c "cd hardware/sim && make"
+# Full-path chirp sim + plot (Docker)
+docker compose run --rm dev bash -c "python3 hardware/scripts/chirp_sim_sram.py"
+# On the Pi (after flashing the bitstream):
+python3 hardware/scripts/hw_test_signals.py     # DC/ramp/sin/chirp, both input paths
+python3 hardware/scripts/bench_fft.py           # performance
+```
 
 ## Hardware
 

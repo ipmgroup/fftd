@@ -18,10 +18,15 @@
 > - **External SRAM is used as a result double-buffer**: results are copied
 >   BRAM→SRAM each frame, so the host streams frame *N* while the core computes
 >   frame *N+1*. A pipelined host loop reaches **~2.0× throughput** (~500 FFT/s).
+> - **External SRAM is also an input double-buffer**: `WRITE_SRAM` (0x43) stages
+>   the next input frame into SRAM while the core is busy/being read out; a START
+>   triggers an input-DMA (SRAM→BRAM) before the FFT runs. A priority FIFO drains
+>   host writes between output-DMA bins so samples are never dropped.
 > - **FFT output is complex** (re+im, 4 bytes/bin) with a block-floating-point
 >   exponent in the STATUS byte — not real-only, 2 bytes/bin.
-> - The 1024-point pipeline is the validated configuration (ramp correlates
->   1.000000 with NumPy; chirp 0.999988).
+> - The 1024-point pipeline is the validated configuration. Verified on hardware
+>   (DC/ramp/sin correlate 1.000000 with NumPy, chirp 0.999987) through **both**
+>   the direct BRAM (0x41) and SRAM-staged (0x43) input paths.
 
 ---
 
