@@ -164,6 +164,32 @@ static void flash_write_enable(void) {
     flash_spi_end();
 }
 
+// Read status register (0x05); bit0 = WIP (write/erase in progress).
+static uint8_t flash_read_status(void) {
+    flash_spi_begin();
+    flash_spi_xfer(0x05, 8);
+    uint8_t s = flash_spi_xfer(0, 8);
+    flash_spi_end();
+    return s;
+}
+
+// Block until the flash finishes the current write/erase (WIP clears).
+static void flash_wait_wip(void) {
+    while (flash_read_status() & 0x01)
+        usleep(1000);
+}
+
+// Whole-chip erase (0xC7). Required before programming a full bitstream:
+// the previous per-sector erase only cleared the first 4 KB, so the rest of
+// a ~135 KB bitstream was written into non-erased flash and corrupted.
+static void flash_chip_erase(void) {
+    flash_write_enable();
+    flash_spi_begin();
+    flash_spi_xfer(0xC7, 8);
+    flash_spi_end();
+    flash_wait_wip();   // chip erase takes several seconds
+}
+
 static void flash_erase_sector(uint32_t addr) {
     flash_write_enable();
     flash_spi_begin();
@@ -192,11 +218,13 @@ static void flash_program_page(uint32_t addr, uint8_t *data, int len) {
 // CRESET_B is held LOW by main() before this is called,
 // so the FPGA is in reset and the SPI flash bus is accessible.
 static void prog_flash(FILE *f) {
-    printf("Erasing Flash sector 0...\n");
     flash_mode_enter();
     flash_power_up();
     flash_read_id();
-    flash_erase_sector(0);
+
+    printf("Erasing Flash (whole chip)...\n");
+    fflush(stdout);
+    flash_chip_erase();
 
     printf("Programming Flash...\n");
     uint8_t buf[256];
@@ -205,8 +233,9 @@ static void prog_flash(FILE *f) {
         size_t n = fread(buf, 1, sizeof(buf), f);
         if (n == 0) break;
         flash_program_page(page * 256, buf, n);
+        flash_wait_wip();
         total += n;
-        if (total % 4096 == 0) printf("  %d bytes...\n", total);
+        if (total % 8192 == 0) { printf("  %d bytes...\n", total); fflush(stdout); }
     }
     printf("✅ Flash programmed (%d bytes)\n", total);
     flash_mode_leave();
