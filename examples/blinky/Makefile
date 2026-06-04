@@ -22,7 +22,10 @@ YOSYS    := yosys
 NEXTPNR  := nextpnr-ice40
 ICEPACK  := icepack
 
-.PHONY: all prog deploy clean
+# aarch64 cross-compiler for the Pi 5 (Pi 4/earlier: aarch64 OS still works).
+CROSS64  ?= aarch64-linux-gnu-
+
+.PHONY: all prog deploy icezprog clean
 
 all: $(BITFILE)
 	@echo "✅ Bitstream ready: $(BITFILE)"
@@ -53,6 +56,14 @@ deploy: $(BITFILE)
 	ssh $(PI_HOST) "cd $(PI_TMP) && \
 		sudo python3 icezprog.py $(BITFILE) && \
 		echo '✅ Blinky programmed!'"
+
+# ── Cross-compile the fast C programmer for the Pi (aarch64) ───────
+# Build in Docker:  docker compose run --rm dev make -C examples/blinky icezprog
+# Needs liblgpio-dev:arm64 (baked into the dev image). Bit-bangs the ICEZero
+# CFG_* pins ~30× faster than the RPi.GPIO Python version — SRAM config in ~2.3 s.
+icezprog: icezprog.c
+	$(CROSS64)gcc -O2 -o $@ $< -llgpio
+	@echo "✅ icezprog (aarch64) built — scp to the Pi: ./icezprog design.bin"
 
 # ── Clean ──────────────────────────────────────────
 clean:

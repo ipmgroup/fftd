@@ -53,6 +53,7 @@ help:
 	@echo "  make docker-shell — Interactive shell in container"
 	@echo "  make docker-synth — Synthesize FPGA in Docker"
 	@echo "  make docker-blinky— Build blinky test in Docker"
+	@echo "  make docker-icezprog — Cross-compile the C ICEZero programmer (aarch64) in Docker"
 	@echo "  make docker-all   — Full build in Docker"
 
 # ── Docker ──────────────────────────────────────────
@@ -67,6 +68,10 @@ docker-synth:
 
 docker-blinky:
 	docker compose run --rm blinky
+
+# Cross-compile the fast C ICEZero programmer (aarch64) inside the dev image.
+docker-icezprog:
+	docker compose run --rm dev make -C examples/blinky icezprog
 
 docker-sim:
 	docker compose run --rm sim

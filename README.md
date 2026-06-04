@@ -45,6 +45,29 @@ make docker-blinky
 make docker-shell
 ```
 
+### Building the C FPGA programmer (icezprog) in Docker
+
+`examples/blinky/icezprog.c` bit-bangs the ICEZero `CFG_*` pins to load a
+bitstream into the FPGA SRAM. The C build is ~30× faster than the `RPi.GPIO`
+Python version (`icezprog.py`) — SRAM config in ~2.3 s — so it's the preferred
+flasher. It runs on the **Pi (aarch64)** and links `liblgpio`, so it's
+cross-compiled in the dev image (which ships `liblgpio-dev:arm64`):
+
+```bash
+make docker-build                 # one-time: image bakes in arm64 lgpio
+make docker-icezprog              # → examples/blinky/icezprog (aarch64 ELF)
+
+# equivalently, inside the container:
+docker compose run --rm dev make -C examples/blinky icezprog
+
+# then copy to the Pi and flash a bitstream:
+scp examples/blinky/icezprog pi@rpia5.local:/home/pi/fftd/examples/blinky/
+ssh pi@rpia5.local "cd /home/pi/fftd && sudo ./examples/blinky/icezprog fft_top.bin"
+```
+
+> If you skipped `make docker-build` after pulling these changes, rebuild the
+> image first — the arm64 `lgpio` package is added there.
+
 ### Native (requires toolchain installation)
 
 ```bash

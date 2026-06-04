@@ -37,6 +37,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# ── ARM64 multiarch: liblgpio for cross-compiling the ICEZero programmer ──
+# The C programmer (examples/blinky/icezprog.c) links -llgpio and runs on the
+# Pi (aarch64). Enable the arm64 architecture (served from ports.ubuntu.com;
+# the default archive.ubuntu.com is amd64/i386 only) and install lgpio for it.
+RUN dpkg --add-architecture arm64 && \
+    sed -i '/Signed-By: \/usr\/share\/keyrings\/ubuntu-archive-keyring.gpg/i Architectures: amd64' \
+        /etc/apt/sources.list.d/ubuntu.sources && \
+    printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports/\nSuites: noble noble-updates\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+        > /etc/apt/sources.list.d/arm64.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends liblgpio-dev:arm64 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # ── 1. Build icestorm from source (YosysHQ/icestorm) ─────────────
 # Must be first: nextpnr needs icestorm chipdb at cmake time
 RUN mkdir -p /tmp/build && cd /tmp/build && \
