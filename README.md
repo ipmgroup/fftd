@@ -183,6 +183,10 @@ Last full run (2026-06-04) — all suites green:
 | HW perf — `bench_pipeline.py` | compute/readout overlap | serial 4.07 → pipelined **2.00 ms/frame**, **2.03×**, 30/30 correct |
 | HW perf — `bench_bulk.py` | chunked vs bulk readout | bit-exact, bulk 1.80 ms vs chunked 2.30 ms (**1.28×**) |
 
+Chirp (18–34 kHz) on real hardware — FPGA spectrum vs NumPy reference (booting from QSPI flash, corr **0.999987**):
+
+![Chirp FFT — FPGA hardware vs NumPy](hardware/scripts/plot/chirp_hw_comparison.png)
+
 ```bash
 # RTL functional suite (Docker)
 docker compose run --rm dev bash -c "cd hardware/sim && make"
