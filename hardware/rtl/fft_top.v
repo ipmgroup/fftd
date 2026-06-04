@@ -492,6 +492,13 @@ module fft_top (
     wire [N_LOG2-1:0] rd_bin_c;
     ff2_sync #(.W(N_LOG2)) u_rdbin_sync (.clk(clk), .d(rd_bin), .q(rd_bin_c));
 
+    // `reading` (SPI domain) → core. Held high for the whole read transaction,
+    // so a 2-FF level sync is safe. The DMA copy of the next frame is deferred
+    // while this is high so it cannot overwrite the SRAM buffer the host is
+    // currently streaming (single-buffer compute/readout overlap, B2).
+    wire reading_c;
+    ff2_sync u_reading_sync (.clk(clk), .d(reading), .q(reading_c));
+
     reg [N_LOG2-1:0] dma_addr;       // BRAM read address (DMA only)
     reg [N_LOG2-1:0] dma_i;          // current bin being copied
     reg              dma_active;
@@ -531,7 +538,10 @@ module fft_top (
             case (sched)
                 // ── Read-server: keep sram_rd_word fresh for rd_bin_c ──
                 SC_RD_REQ: begin
-                    if (dma_pending) begin
+                    // Start the copy only when no SPI read is in flight, so the
+                    // host can keep streaming the previous frame from SRAM while
+                    // the next frame computes; the copy runs once the read ends.
+                    if (dma_pending && !reading_c) begin
                         dma_pending <= 0;
                         dma_active  <= 1;
                         dma_i       <= 0;

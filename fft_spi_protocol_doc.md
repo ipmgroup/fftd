@@ -5,7 +5,8 @@
 **Status**: Production Ready  
 **Update**: Complex (re+im) 4-byte/bin output with BFP exponent; dual-clock SPI
 domain (87.5 MHz) decoupled from the FFT core (43.75 MHz); BULK_READ (0x23)
-streaming readout; re-measured reliable ceiling 14 MHz SCK
+streaming readout; re-measured reliable ceiling 14 MHz SCK; SRAM double-buffer
+enabling compute/readout overlap (≈2× throughput)
 
 ---
 
@@ -259,6 +260,32 @@ MISO: [0x23] [0x04] [SEQ] [CHECKSUM] [Re0_H][Re0_L][Im0_H][Im0_L][Re1_H]...
 - **spidev note**: one transaction carries `9 + n_bins*4` bytes. The default
   spidev transfer buffer is 4096 B, so Hermitian (`N/2+1 = 513` bins → 2061 B)
   fits comfortably; a full 1024-bin read needs `spidev.bufsiz` raised.
+
+#### SRAM double-buffer & pipelined throughput
+
+After every frame the FPGA copies the 1024 complex bins from the FFT core BRAM
+into external SRAM (transparent to the host — the readout simply streams from
+SRAM). Because the result lives in SRAM, the core BRAM is free to compute the
+next frame **while the host is still reading the previous one**. The hardware
+defers the next BRAM→SRAM copy until the current read finishes, so a single
+SRAM buffer is sufficient and no protocol field changes.
+
+To exploit the overlap the host pipelines START with the read of the previous
+frame:
+
+```
+control(START); wait_done()          # prime frame 0
+loop:
+    control(START)                   # kick frame n+1 (computes during the read)
+    bins = bulk_read(N, hermitian)   # stream frame n from SRAM
+    wait_done()                      # frame n+1 copied to SRAM (short — compute
+                                     #   already finished under the readout)
+```
+
+Measured: serial ≈ 4.0 ms/frame → pipelined ≈ 2.0 ms/frame (**~2.0× throughput**,
+~500 FFT/s @ 14 MHz SCK). The STATUS BFP exponent is latched per buffer, so the
+value the host rescales with always matches the frame being read, even while a
+different exponent is being computed for the next frame.
 
 ---
 

@@ -18,7 +18,11 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
 - **SPI Protocol**: XOR-checksum framing, reliable up to **14 MHz SCK**
   (re-measured 0/10 bit-exact; 15 MHz+ drops bits). `BULK_READ` (0x23) streams
   the whole spectrum in one transaction — ~1.27× faster readout than chunked.
-- **Latency** (N=1024): ~1.1 ms compute + ~1.8 ms readout (Hermitian bulk, 14 MHz SCK)
+- **SRAM double-buffer**: each result is copied to external AS6C4008 SRAM, so the
+  host streams frame *N* while the core already computes frame *N+1*. Pipelined
+  host loop → **2.0× throughput** (~500 FFT/s vs ~246, measured).
+- **Latency** (N=1024): ~1.1 ms compute + ~1.8 ms readout (Hermitian bulk, 14 MHz
+  SCK); with overlap the steady-state cost is **~2.0 ms/frame** (compute hidden).
 
 ## Quick Start
 
@@ -110,14 +114,15 @@ Benchmark comparing FPGA (ICE40HX4K, dual-clock 87.5/43.75 MHz, 16-bit Q1.15) vs
 
 | Method | Time/FFT | vs FPGA | Notes |
 |--------|----------|---------|-------|
-| **FPGA** ICE40HX4K | **~4.0 ms** | 1× | 2.22 ms compute (poll-inflated) + 1.81 ms readout @ 14 MHz (bulk) |
+| **FPGA** serial | **~4.0 ms** | 1× | 2.22 ms compute (poll-inflated) + 1.81 ms readout @ 14 MHz (bulk) |
+| **FPGA** pipelined | **~2.0 ms** | — | SRAM double-buffer: compute *N+1* hidden under readout *N* → **500 FFT/s** |
 | FPGA compute only | ~1.1 ms | — | 43.75 MHz core; measured 2.22 ms is poll-quantized (poll_ms=1) |
 | FPGA readout (Hermitian, bulk 0x23) | 1.81 ms | — | 513 complex bins, one transaction @ 14 MHz SCK (chunked: 2.29 ms) |
 | numpy.fft float64 | 16 µs | 269× | NEON-optimized, 64-bit float |
 | numpy.fft float32 | 16 µs | 272× | NEON-optimized, 32-bit float |
 | **FFTW3** float32 | **4.4 µs** | **967×** | C API, `-O3 -march=native` |
 
-**FPGA resources**: 2430/7680 LC — 31% (ICE40HX4K: 3520 LUT4 + 3520 FF), 28/32 BRAM (87%). Fmax: SPI domain 95 MHz (runs at 87.5), core domain 73 MHz (runs at 43.75).
+**FPGA resources**: 2678/7680 LC — 34% (ICE40HX4K: 3520 LUT4 + 3520 FF; includes the SRAM DMA/read-server), 28/32 BRAM (87%). Fmax: SPI domain ~105 MHz (runs at 87.5), core domain ~70 MHz (runs at 43.75).
 
 **Why CPU is faster for N=1024**:
 - 2.4 GHz vs 43.75 MHz = 55× clock advantage

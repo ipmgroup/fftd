@@ -15,6 +15,9 @@
 >   The core clock is LUT-multiplier-bound (~73 MHz Fmax; ICE40HX has no DSP).
 > - **SPI SCK** is reliable up to **14 MHz** (re-measured bit-exact; 15 MHz+ drops bits).
 >   `BULK_READ` (0x23) streams the whole spectrum in one transaction (~1.27× faster readout).
+> - **External SRAM is used as a result double-buffer**: results are copied
+>   BRAM→SRAM each frame, so the host streams frame *N* while the core computes
+>   frame *N+1*. A pipelined host loop reaches **~2.0× throughput** (~500 FFT/s).
 > - **FFT output is complex** (re+im, 4 bytes/bin) with a block-floating-point
 >   exponent in the STATUS byte — not real-only, 2 bytes/bin.
 > - The 1024-point pipeline is the validated configuration (ramp correlates
