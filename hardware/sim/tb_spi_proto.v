@@ -25,6 +25,11 @@ module tb_spi_proto;
     wire       drdy;
     wire       led1, led2, led3;
 
+    // ── External SRAM pins + behavioural model ────
+    wire [18:0] sram_a;
+    wire [15:0] sram_dq;
+    wire        sram_ce_n, sram_oe_n, sram_we_n, sram_lb_n, sram_ub_n;
+
     // ── DUT ───────────────────────────────────────
     fft_top dut (
         .clk_100mhz (clk),
@@ -35,7 +40,24 @@ module tb_spi_proto;
         .drdy       (drdy),
         .led1       (led1),
         .led2       (led2),
-        .led3       (led3)
+        .led3       (led3),
+        .sram_a     (sram_a),
+        .sram_dq    (sram_dq),
+        .sram_ce_n  (sram_ce_n),
+        .sram_oe_n  (sram_oe_n),
+        .sram_we_n  (sram_we_n),
+        .sram_lb_n  (sram_lb_n),
+        .sram_ub_n  (sram_ub_n)
+    );
+
+    sram_model u_sram (
+        .a    (sram_a),
+        .dq   (sram_dq),
+        .ce_n (sram_ce_n),
+        .oe_n (sram_oe_n),
+        .we_n (sram_we_n),
+        .lb_n (sram_lb_n),
+        .ub_n (sram_ub_n)
     );
 
     // ── 100 MHz clock ─────────────────────────────
@@ -266,6 +288,44 @@ module tb_spi_proto;
         end
     endtask
 
+    // ── BULK_READ (0x23): stream N bins in one transaction ──
+    task test_bulk_read;
+        input integer num_bins;
+        integer total, i, off;
+        reg [7:0] h0, h1, h2, h3;
+        reg [15:0] re, im;
+        integer b;
+        begin
+            $display("[TEST] BULK_READ (0x23) %0d bins (1 transaction)...", num_bins);
+            // Frame: CMD,LEN=0,SEQ,XSUM, GAP, then stream 4*num_bins data bytes.
+            off   = 9;                      // 4 hdr + 1 gap + 4 TX hdr
+            total = off + num_bins * 4;
+            tx_buf[0] = 8'h23;
+            tx_buf[1] = 8'd0;
+            tx_buf[2] = 8'd7;
+            tx_buf[3] = xsum(8'h23, 8'd0, 8'd7);
+            for (i = 4; i < total; i = i + 1)
+                tx_buf[i] = 8'h00;
+
+            spi_xfer(total);
+
+            h0 = rx_buf[5]; h1 = rx_buf[6]; h2 = rx_buf[7]; h3 = rx_buf[8];
+            verify_xsum(h0, h1, h2, h3, "BULK");
+            if (h0 != 8'h23) begin
+                $display("  FAIL: resp CMD=0x%02h (exp 0x23)", h0);
+                test_fail = test_fail + 1;
+            end else begin
+                for (b = 0; b < 6 && b < num_bins; b = b + 1) begin
+                    re = {rx_buf[off + b*4 + 0], rx_buf[off + b*4 + 1]};
+                    im = {rx_buf[off + b*4 + 2], rx_buf[off + b*4 + 3]};
+                    $display("    bin[%0d] re=0x%04h im=0x%04h", b, re, im);
+                end
+                $display("  PASS: streamed %0d bins in one transaction", num_bins);
+                test_pass = test_pass + 1;
+            end
+        end
+    endtask
+
     task test_bad_checksum;
         integer total, i, off;
         reg [7:0] h0, h1, h2, h3;
@@ -319,6 +379,7 @@ module tb_spi_proto;
         test_wait_done();
         test_read(6'd8);
         test_read(6'd63);
+        test_bulk_read(8);
         test_bad_checksum();
 
         $display("");
@@ -337,9 +398,35 @@ module tb_spi_proto;
 
     // Watchdog
     initial begin
-        #10000000;
+        #30000000;
         $display("TIMEOUT");
         $stop;
     end
 
+endmodule
+
+//=============================================================================
+// sram_model — behavioural async SRAM (AS6C4008 512K×16), enough for sim.
+//   Read : combinational drive when CE#=0, OE#=0, WE#=1.
+//   Write: latched on WE# rising edge with byte enables LB#/UB#.
+//=============================================================================
+module sram_model (
+    input  wire [18:0] a,
+    inout  wire [15:0] dq,
+    input  wire        ce_n,
+    input  wire        oe_n,
+    input  wire        we_n,
+    input  wire        lb_n,
+    input  wire        ub_n
+);
+    reg [15:0] mem [0:524287];
+
+    assign dq = (!ce_n && !oe_n && we_n) ? mem[a] : 16'hzzzz;
+
+    always @(posedge we_n or posedge ce_n) begin
+        if (!ce_n) begin   // sampled as WE#/CE# returns high → data still driven
+            if (!lb_n) mem[a][7:0]  <= dq[7:0];
+            if (!ub_n) mem[a][15:8] <= dq[15:8];
+        end
+    end
 endmodule

@@ -103,6 +103,9 @@ module fft_top (
     reg  [7:0]  ext_resp_len;
     reg         ext_resp_valid;
 
+    // BULK_READ (0x23): stream the whole spectrum in one SPI transaction.
+    wire        stream_mode = (cmd_byte == 8'h23);
+
     spi_slave_proto spi_proto (
         .clk            (clk_spi),
         .rst_n          (rst_n_spi),
@@ -123,6 +126,7 @@ module fft_top (
         .tx_done        (tx_done),
         .ext_resp_len   (ext_resp_len),
         .ext_resp_valid (ext_resp_valid),
+        .stream_mode    (stream_mode),
         .cs_active      (cs_active),
         .in_gap         (in_gap),
         .in_tx_data     (in_tx_data)
@@ -152,8 +156,11 @@ module fft_top (
     wire [3:0] fft_bfp_exp;        // BFP exponent from fft_core (true = out << exp)
     wire fft_ready = !fft_busy && rst_n;
     // Use drdy_r (latched) instead of fft_done (1-cycle pulse) for status.
-    // Low nibble carries the BFP exponent so the host can rescale results.
-    wire [7:0] status_byte = {fft_ready, fft_busy, drdy_r, 1'b0, fft_bfp_exp};
+    // Low nibble carries the BFP exponent of the buffered (SRAM) result —
+    // latched at DMA time so it stays valid even while a new FFT recomputes a
+    // different exponent in the core. sram_exp declared with the scheduler.
+    wire [3:0] sram_exp;
+    wire [7:0] status_byte = {fft_ready, fft_busy, drdy_r, 1'b0, sram_exp};
 
     // core→SPI: status byte synchronised into the SPI domain. When `done`
     // propagates, bfp_exp has been stable for many cycles, so no bit-skew
@@ -162,11 +169,13 @@ module fft_top (
     ff2_sync #(.W(8)) u_status_sync (
         .clk(clk_spi), .d(status_byte), .q(status_byte_spi));
 
-    // core→SPI: frame_done pulse to reset the readout bin pointer.
-    wire fft_done_spi;
+    // core→SPI: DMA-complete pulse to reset the readout bin pointer (the result
+    // is only available in SRAM once the BRAM→SRAM copy has finished).
+    wire dma_done;                 // core-domain pulse (declared with scheduler)
+    wire dma_done_spi;
     pulse_sync u_done_sync (
-        .src_clk(clk), .src_pulse(fft_done),
-        .dst_clk(clk_spi), .dst_rst_n(rst_n_spi), .dst_pulse(fft_done_spi));
+        .src_clk(clk), .src_pulse(dma_done),
+        .dst_clk(clk_spi), .dst_rst_n(rst_n_spi), .dst_pulse(dma_done_spi));
 
     // ── DRDY output (cleared after readout completes or FFT restarts) ──
     reg drdy_r;
@@ -174,8 +183,8 @@ module fft_top (
         if (!rst_n) begin
             drdy_r <= 0;
         end else begin
-            if (fft_done)
-                drdy_r <= 1;
+            if (dma_done)
+                drdy_r <= 1;       // result copied to SRAM → ready to read
             if (feed_start)
                 drdy_r <= 0;
         end
@@ -303,14 +312,30 @@ module fft_top (
         end
     end
 
-    wire feed_start = fft_start_cmd || (!fft_busy && !fft_done && !drdy_r);
+    // Start sequencing. A start request (host START or the one-shot free-run at
+    // boot) is latched and only consumed once BOTH the core and the BRAM→SRAM
+    // copy DMA are idle — starting a new FFT mid-copy would raise `busy` (which
+    // gates ext_rd_data) and overwrite the BRAM, corrupting the buffered result.
+    wire dma_idle = !dma_active && !dma_pending;
+    wire free_run = !drdy_r && !result_in_sram;   // self-test FFT, only pre-first-result
 
-    // start: hold until FFT begins loading
+    reg start_pending;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) start_pending <= 0;
+        else begin
+            if (fft_start_cmd) start_pending <= 1;
+            if (fft_start_r)   start_pending <= 0;
+        end
+    end
+
+    wire do_start = !fft_busy && !fft_done && dma_idle && (start_pending || free_run);
+    wire feed_start = fft_start_r;
+
     reg fft_start_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             fft_start_r <= 0;
-        else if (!fft_busy && !fft_done && !drdy_r)
+        else if (do_start)
             fft_start_r <= 1;
         else if (fft_busy)
             fft_start_r <= 0;
@@ -348,17 +373,19 @@ module fft_top (
     reg [31:0]        tx_word;      // {re_hi, re_lo, im_hi, im_lo}, MSB first
     reg               reading;
 
-    assign ext_rd_addr = rd_bin;
+    // SRAM-backed readout word, maintained by the core-domain read-server for
+    // the bin currently addressed by rd_bin (see the SRAM scheduler below).
+    wire [31:0] sram_rd_word;
 
     // Bytes for the current bin, packed MSB-first.
     wire [31:0] bin_word = {rd_data[15:0], rd_data[31:16]};
 
-    // Readout runs in the SPI clock domain (clk_spi). It drives the core BRAM
-    // read address (ext_rd_addr = rd_bin) and samples ext_rd_data — a CDC read
-    // that is safe because rd_bin is held stable for a full byte period and the
-    // next bin is prefetched 2 byte periods ahead (see the byte FSM below).
+    // Readout runs in the SPI clock domain (clk_spi). It samples sram_rd_word —
+    // a core→SPI CDC read that is safe because rd_bin is held stable per bin and
+    // the next bin is prefetched 2 byte periods ahead, giving the read-server
+    // ample time to refresh sram_rd_word for the new address.
     always @(posedge clk_spi) begin
-        rd_data <= ext_rd_data;   // settles a few clk_spi cycles after rd_bin
+        rd_data <= sram_rd_word;
     end
 
     always @(posedge clk_spi or negedge rst_n_spi) begin
@@ -368,15 +395,25 @@ module fft_top (
             reading     <= 0;
             tx_word     <= 0;
         end else begin
-            if (fft_done_spi) rd_bin <= 0;
+            if (dma_done_spi) rd_bin <= 0;  // result available once DMA→SRAM done
 
-            if (cmd_valid && cmd_byte == 8'h21) begin
-                rd_byte_idx <= 0;
-                reading     <= 1;
-                tx_word     <= bin_word;   // load first bin (rd_data settled)
+            // READ_RESULT (0x21): chunked read, rd_bin persists across frames.
+            if (cmd_valid && cmd_byte == 8'h21)
+                reading <= 1;
+
+            // BULK_READ (0x23): stream whole spectrum, restart from bin 0.
+            if (cmd_valid && cmd_byte == 8'h23) begin
+                reading <= 1;
+                rd_bin  <= 0;
             end
 
-            if (tx_rd && reading) begin
+            if (reading && !in_tx_data) begin
+                // Pre-data phase (command echo / gap / TX header): keep the
+                // current bin loaded so the first data byte = bin_word[31:24].
+                // For BULK_READ this also waits out the rd_bin=0 settle.
+                rd_byte_idx <= 0;
+                tx_word     <= bin_word;
+            end else if (tx_rd && reading) begin
                 case (rd_byte_idx)
                     2'd0: begin rd_byte_idx <= 2'd1; tx_word <= {tx_word[23:0], 8'h00}; end
                     2'd1: begin rd_byte_idx <= 2'd2; tx_word <= {tx_word[23:0], 8'h00};
@@ -386,7 +423,9 @@ module fft_top (
                 endcase
             end
 
-            if (tx_done && reading)
+            // End of any SPI transaction clears the read flag (covers both the
+            // chunked 0x21 path and the CS-terminated BULK_READ stream).
+            if (!cs_active)
                 reading <= 0;
         end
     end
@@ -397,6 +436,7 @@ module fft_top (
     always @(*) begin
         tx_data_byte = status_byte_spi;    // default: STATUS_REQ (synced)
         if (cmd_byte == 8'h21)  tx_data_byte = rd_byte;
+        if (cmd_byte == 8'h23)  tx_data_byte = rd_byte;   // BULK_READ stream
         if (cmd_byte == 8'h41)  tx_data_byte = cmd_len;
         if (cmd_error)          tx_data_byte = 8'h01;
     end
@@ -414,6 +454,12 @@ module fft_top (
             ext_resp_len   <= num_bins_r * 8'd4;  // 4 bytes/bin (re + im)
             ext_resp_valid <= 1;
         end
+        // BULK_READ: enter TX_DATA with a nonzero length; stream_mode keeps it
+        // from terminating, so the actual byte count is set by the master (CS).
+        if (in_gap && cmd_byte == 8'h23) begin
+            ext_resp_len   <= 8'd4;
+            ext_resp_valid <= 1;
+        end
     end
 
     // ── LEDs ──────────────────────────────────────
@@ -421,20 +467,124 @@ module fft_top (
     assign led2 = din_valid;   // DEBUG: blink during data load
     assign led3 = drdy_r;
 
-    // ── SRAM Controller (for future data buffer) ──
-    // Currently idle: Pi↔SRAM data path via WRITE_DATA/READ_RESULT TBD
-    wire        sram_req;
-    wire        sram_wr;
-    wire [18:0] sram_addr;
-    wire [31:0] sram_wdata;
+    // ── SRAM result buffer: DMA (BRAM→SRAM) + read-server ──────────────
+    // Double-buffering datapath. After each FFT frame the 1024 complex bins are
+    // copied from the core BRAM into external SRAM (DMA). The SPI readout then
+    // streams from SRAM, freeing the core BRAM so the next FFT can compute while
+    // the host is still reading the previous result.
+    //
+    // A single core-domain scheduler owns sram_ctrl, so there is never a request
+    // conflict: by default it runs the read-server (refreshing sram_rd_word for
+    // the bin the SPI side is reading); when a frame completes it switches to the
+    // DMA copy loop (higher priority), then returns to serving reads.
+
+    reg         sram_req;
+    reg         sram_wr;
+    reg  [18:0] sram_addr;
+    reg  [31:0] sram_wdata;
     wire [31:0] sram_rdata;
     wire        sram_busy, sram_done, sram_rvalid;
 
-    // Tie SRAM to idle for now (no requests)
-    assign sram_req  = 1'b0;
-    assign sram_wr   = 1'b0;
-    assign sram_addr = 19'd0;
-    assign sram_wdata = 32'd0;
+    // rd_bin (SPI domain) → core domain. Slowly changing (one step per ~4 SPI
+    // byte periods), so a 2-FF vector sync with a little bit-skew is fine: the
+    // read-server re-reads continuously and settles long before the SPI side
+    // samples the prefetched word.
+    wire [N_LOG2-1:0] rd_bin_c;
+    ff2_sync #(.W(N_LOG2)) u_rdbin_sync (.clk(clk), .d(rd_bin), .q(rd_bin_c));
+
+    reg [N_LOG2-1:0] dma_addr;       // BRAM read address (DMA only)
+    reg [N_LOG2-1:0] dma_i;          // current bin being copied
+    reg              dma_active;
+    reg              dma_done_r;     // 1-cycle pulse when copy finishes
+    reg              dma_pending;    // a frame finished, awaiting copy
+    reg              result_in_sram;
+    reg  [3:0]       sram_exp_r;     // BFP exponent of the buffered result
+    reg  [31:0]      sram_rd_word_r; // current bin word for the SPI readout
+    reg  [2:0]       brwait;
+
+    assign ext_rd_addr  = dma_addr;
+    assign dma_done     = dma_done_r;
+    assign sram_exp     = sram_exp_r;
+    assign sram_rd_word = sram_rd_word_r;
+
+    localparam SC_RD_REQ  = 3'd0,
+               SC_RD_WAIT = 3'd1,
+               SC_DMA_SET = 3'd2,
+               SC_DMA_WAIT= 3'd3,
+               SC_DMA_WR  = 3'd4,
+               SC_DMA_NEXT= 3'd5;
+    reg [2:0] sched;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sram_req <= 0; sram_wr <= 0; sram_addr <= 0; sram_wdata <= 0;
+            dma_addr <= 0; dma_i <= 0; dma_active <= 0; dma_done_r <= 0;
+            dma_pending <= 0; result_in_sram <= 0; sram_exp_r <= 0;
+            sram_rd_word_r <= 0; brwait <= 0; sched <= SC_RD_REQ;
+        end else begin
+            sram_req   <= 0;   // default: pulse req for one cycle
+            dma_done_r <= 0;
+
+            // A finished FFT frame schedules a BRAM→SRAM copy.
+            if (fft_done) dma_pending <= 1;
+
+            case (sched)
+                // ── Read-server: keep sram_rd_word fresh for rd_bin_c ──
+                SC_RD_REQ: begin
+                    if (dma_pending) begin
+                        dma_pending <= 0;
+                        dma_active  <= 1;
+                        dma_i       <= 0;
+                        sched       <= SC_DMA_SET;
+                    end else begin
+                        sram_req  <= 1;
+                        sram_wr   <= 0;
+                        sram_addr <= {rd_bin_c, 2'b00};   // byte addr = bin*4
+                        sched     <= SC_RD_WAIT;
+                    end
+                end
+                SC_RD_WAIT: begin
+                    if (sram_rvalid) begin
+                        sram_rd_word_r <= sram_rdata;
+                        sched <= SC_RD_REQ;
+                    end
+                end
+
+                // ── DMA: copy bram[dma_i] → SRAM[dma_i] ──
+                SC_DMA_SET: begin
+                    dma_addr <= dma_i;     // drive BRAM ext read port
+                    brwait   <= 0;
+                    sched    <= SC_DMA_WAIT;
+                end
+                SC_DMA_WAIT: begin
+                    brwait <= brwait + 1;
+                    if (brwait == 3'd3) begin   // ext_rd_data valid (2-cyc BRAM pipe + margin)
+                        sram_req   <= 1;
+                        sram_wr    <= 1;
+                        sram_addr  <= {dma_i, 2'b00};
+                        sram_wdata <= ext_rd_data;
+                        sched      <= SC_DMA_WR;
+                    end
+                end
+                SC_DMA_WR: begin
+                    if (sram_done) sched <= SC_DMA_NEXT;
+                end
+                SC_DMA_NEXT: begin
+                    if (dma_i == N-1) begin
+                        dma_active     <= 0;
+                        dma_done_r     <= 1;
+                        result_in_sram <= 1;
+                        sram_exp_r     <= fft_bfp_exp;  // latch this frame's exponent
+                        sched          <= SC_RD_REQ;
+                    end else begin
+                        dma_i <= dma_i + 1;
+                        sched <= SC_DMA_SET;
+                    end
+                end
+                default: sched <= SC_RD_REQ;
+            endcase
+        end
+    end
 
     sram_ctrl sram (
         .clk        (clk),

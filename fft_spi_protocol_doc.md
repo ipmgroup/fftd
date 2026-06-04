@@ -1,10 +1,11 @@
 # SPI_PROTOCOL.md — Raspberry Pi ↔ ICE40HX4K FFT Engine
 
-**Version**: 1.2  
+**Version**: 1.3  
 **Date**: 2026-06-04  
 **Status**: Production Ready  
 **Update**: Complex (re+im) 4-byte/bin output with BFP exponent; dual-clock SPI
-domain (87.5 MHz) decoupled from the FFT core (43.75 MHz); reliable 16 MHz SCK
+domain (87.5 MHz) decoupled from the FFT core (43.75 MHz); BULK_READ (0x23)
+streaming readout; re-measured reliable ceiling 14 MHz SCK
 
 ---
 
@@ -14,9 +15,10 @@ This document describes the SPI protocol for data exchange between Raspberry Pi 
 
 ### Key Parameters
 
-- **SPI Frequency**: up to **16 MHz SCK** (reliable). The SPI slave runs in its
-  own 87.5 MHz clock domain (`SB_PLL40_2F_PAD` GENCLK), decoupled from the
-  43.75 MHz FFT core (GENCLK_HALF) via clock-domain-crossing synchronisers.
+- **SPI Frequency**: up to **14 MHz SCK** (reliable, 0/10 fails bit-exact;
+  15 MHz+ drops bits). The SPI slave runs in its own 87.5 MHz clock domain
+  (`SB_PLL40_2F_PAD` GENCLK), decoupled from the 43.75 MHz FFT core
+  (GENCLK_HALF) via clock-domain-crossing synchronisers.
 - **SPI Mode**: Mode 0 (CPOL=0, CPHA=0)
 - **Byte Order**: Big-endian (MSB first)
 - **Word Size**: 8 bits
@@ -227,6 +229,39 @@ pointer auto-increments across frames; it resets to bin 0 on `frame_done`.
 
 ---
 
+### 3.4a BULK_READ (0x23) — Streaming Read (one transaction)
+
+`READ_RESULT` is capped at 63 bins/frame by the 8-bit LEN field, so a full
+spectrum needs ~9 separate SPI transactions — and the per-transaction overhead
+(command echo + gap + host syscall) dominates the readout time. `BULK_READ`
+removes that overhead: the FPGA streams 4-byte bins continuously **for as long
+as CS stays asserted**, starting from bin 0. The master simply clocks the exact
+number of bytes it wants, then deasserts CS to stop the stream.
+
+**Request** (no data bytes):
+```
+MOSI: [0x23] [0x00] [SEQ] [CHECKSUM]
+      CMD     LEN           (0x23^0x00^SEQ)
+```
+
+**Response** (TX header, then an unbounded bin stream):
+```
+MISO: [0x23] [0x04] [SEQ] [CHECKSUM] [Re0_H][Re0_L][Im0_H][Im0_L][Re1_H]...
+      CMD     LEN           (echoed)   ← stream continues until CS deasserts →
+```
+
+- The TX-header LEN field (`0x04`) is a placeholder; the real byte count is
+  defined by how long the master keeps CS low, **not** by LEN.
+- The read pointer restarts at bin 0 on each `BULK_READ`, so repeated bulk reads
+  of the same result are allowed without recomputing.
+- Bins are BFP-scaled exactly like `READ_RESULT`; the Hermitian host-side
+  shortcut applies (`N/2+1` bins for real input).
+- **spidev note**: one transaction carries `9 + n_bins*4` bytes. The default
+  spidev transfer buffer is 4096 B, so Hermitian (`N/2+1 = 513` bins → 2061 B)
+  fits comfortably; a full 1024-bin read needs `spidev.bufsiz` raised.
+
+---
+
 ### 3.5 CONTROL (0x50) — FFT Control
 
 **Request**:
@@ -372,11 +407,12 @@ uint8_t compute_checksum(uint8_t cmd, uint8_t len, uint8_t seq) {
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| SPI Clock | up to 16 MHz | Reliable; 17 MHz+ fails (oversampling limit) |
-| SPI domain | 87.5 MHz | GENCLK; oversamples SCK ~5.5× at 16 MHz |
+| SPI Clock | up to 14 MHz | Reliable (0/10, bit-exact); 15 MHz+ drops bits |
+| SPI domain | 87.5 MHz | GENCLK; oversamples SCK ~6× at 14 MHz |
 | FFT core domain | 43.75 MHz | GENCLK_HALF; CDC to the SPI domain |
 | Max chunk size | 252 bytes | Limited by LEN field (8-bit) = 63 complex bins |
-| Recommended chunk | 60 bins | 60 × 4 = 240 bytes/frame |
+| Recommended chunk | 60 bins | 60 × 4 = 240 bytes/frame (chunked 0x21) |
+| Readout (Hermitian @14 MHz) | chunked 2.29 ms / bulk 1.81 ms | BULK_READ 0x23 ≈ 1.27× faster |
 
 The 4-byte/bin readout TX path emits each byte from the top of a shift
 register (`tx_word`) and prefetches the next bin two byte-periods ahead, so it

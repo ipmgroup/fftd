@@ -15,8 +15,10 @@ This project provides an end-to-end DSP pipeline: from Verilog RTL running on an
   NumPy (0/1024 bins fail), chirp 0.999988
 - **Clocking**: dual-clock — SPI domain **87.5 MHz**, FFT core **43.75 MHz**
   (single `SB_PLL40_2F_PAD`, CDC across the boundary)
-- **SPI Protocol**: XOR-checksum framing, reliable up to **16 MHz SCK**
-- **Latency** (N=1024): ~1.1 ms compute + ~2.0 ms readout (Hermitian, 16 MHz SCK)
+- **SPI Protocol**: XOR-checksum framing, reliable up to **14 MHz SCK**
+  (re-measured 0/10 bit-exact; 15 MHz+ drops bits). `BULK_READ` (0x23) streams
+  the whole spectrum in one transaction — ~1.27× faster readout than chunked.
+- **Latency** (N=1024): ~1.1 ms compute + ~1.8 ms readout (Hermitian bulk, 14 MHz SCK)
 
 ## Quick Start
 
@@ -108,9 +110,9 @@ Benchmark comparing FPGA (ICE40HX4K, dual-clock 87.5/43.75 MHz, 16-bit Q1.15) vs
 
 | Method | Time/FFT | vs FPGA | Notes |
 |--------|----------|---------|-------|
-| **FPGA** ICE40HX4K | **4.25 ms** | 1× | 2.22 ms compute (poll-inflated) + 2.03 ms readout @ 16 MHz |
+| **FPGA** ICE40HX4K | **~4.0 ms** | 1× | 2.22 ms compute (poll-inflated) + 1.81 ms readout @ 14 MHz (bulk) |
 | FPGA compute only | ~1.1 ms | — | 43.75 MHz core; measured 2.22 ms is poll-quantized (poll_ms=1) |
-| FPGA readout (Hermitian) | 2.03 ms | — | 513 complex bins @ 16 MHz SCK |
+| FPGA readout (Hermitian, bulk 0x23) | 1.81 ms | — | 513 complex bins, one transaction @ 14 MHz SCK (chunked: 2.29 ms) |
 | numpy.fft float64 | 16 µs | 269× | NEON-optimized, 64-bit float |
 | numpy.fft float32 | 16 µs | 272× | NEON-optimized, 32-bit float |
 | **FFTW3** float32 | **4.4 µs** | **967×** | C API, `-O3 -march=native` |
@@ -151,7 +153,7 @@ Dev PC (x86_64)                    Raspberry Pi + ICEZero (HAT)
   cross-compile lib    ──────────→  run tests & profile
 ```
 
-The ICEZero board mounts directly on the Raspberry Pi's 40-pin GPIO header (HAT form-factor). All communication — bitstream loading (via dedicated CFG_* pins, flashed with the cross-compiled `icezprog` in ~2.3 s) and data transfer — happens over SPI (XOR-checksum protocol, up to 16 MHz SCK). No USB or external programmers required.
+The ICEZero board mounts directly on the Raspberry Pi's 40-pin GPIO header (HAT form-factor). All communication — bitstream loading (via dedicated CFG_* pins, flashed with the cross-compiled `icezprog` in ~2.3 s) and data transfer — happens over SPI (XOR-checksum protocol, up to 14 MHz SCK). No USB or external programmers required.
 
 ## Support
 

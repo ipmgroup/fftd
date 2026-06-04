@@ -53,6 +53,12 @@ module spi_slave_proto (
     input  wire [7:0]  ext_resp_len,    // override resp_data_len
     input  wire        ext_resp_valid,  // 1 = use ext_resp_len instead of default
 
+    // ── Streaming mode (bulk read) ────────────────
+    // When high during TX_DATA the response is NOT terminated by resp_data_len;
+    // bytes keep streaming (tx_rd pulses every byte) until the master deasserts
+    // CS. Used by BULK_READ to return the whole spectrum in one transaction.
+    input  wire        stream_mode,
+
     // ── Convenience: current state exposed ───────
     output wire        cs_active,
     output wire        in_gap,          // high during GAP byte
@@ -248,7 +254,9 @@ module spi_slave_proto (
 
                     ST_TX_DATA: begin
                         tx_cnt <= tx_cnt + 1;
-                        if (tx_cnt == resp_data_len - 1) begin
+                        // In stream mode keep emitting until CS deasserts
+                        // (handled by the !cs_act_w → ST_IDLE reset at top).
+                        if (tx_cnt == resp_data_len - 1 && !stream_mode) begin
                             state <= ST_IDLE;
                         end
                     end

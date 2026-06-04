@@ -13,7 +13,8 @@
 > - **Clocking is dual-domain**: SPI slave at 87.5 MHz, FFT core at 43.75 MHz
 >   (one `SB_PLL40_2F_PAD`, CDC between them) — not a single 50 MHz domain.
 >   The core clock is LUT-multiplier-bound (~73 MHz Fmax; ICE40HX has no DSP).
-> - **SPI SCK** is reliable up to **16 MHz** (not 8 MHz).
+> - **SPI SCK** is reliable up to **14 MHz** (re-measured bit-exact; 15 MHz+ drops bits).
+>   `BULK_READ` (0x23) streams the whole spectrum in one transaction (~1.27× faster readout).
 > - **FFT output is complex** (re+im, 4 bytes/bin) with a block-floating-point
 >   exponent in the STATUS byte — not real-only, 2 bytes/bin.
 > - The 1024-point pipeline is the validated configuration (ramp correlates

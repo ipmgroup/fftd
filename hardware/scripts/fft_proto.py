@@ -11,12 +11,14 @@ import numpy as np
 
 N = 1024
 # Hz — reliable readout speed.
-#   Dual-clock firmware (SPI domain 87.5 MHz, FFT core 43.75 MHz): the 4-byte/
-#   bin complex response is stable up to 16 MHz SCK (verified: 0 fails, corr
-#   1.0). 17 MHz+ fails (Pi clock quantisation pushes it past the oversampling
-#   limit of the 87.5 MHz SPI domain).
+#   Dual-clock firmware (SPI domain 87.5 MHz, FFT core 43.75 MHz). Re-measured
+#   with the BULK_READ stream: both chunked (0x21) and bulk (0x23) paths are
+#   bit-exact up to 14 MHz SCK (0/10 fails). 15 MHz+ starts dropping bits
+#   (single-bit errors in the continuous stream; checksum mismatches on STATUS)
+#   — the earlier "16 MHz" point was borderline, not solid. 14 MHz is the
+#   dependable ceiling given Pi SPI clock quantisation.
 #   Single-clock firmware (50 MHz): use 8 MHz here instead.
-SPI_SPEED = 16000000
+SPI_SPEED = 14000000
 
 # ── Protocol constants ──────────────────────────
 CMD_STATUS_REQ  = 0x60
@@ -27,6 +29,7 @@ CMD_CONTROL     = 0x50
 CMD_SRAM_WRITE  = 0x42
 CMD_SRAM_READ   = 0x22
 CMD_SRAM_ADDR   = 0x52
+CMD_BULK_READ   = 0x23   # stream whole spectrum in one transaction
 
 CTRL_START = 0x01
 CTRL_STOP  = 0x02
@@ -225,6 +228,57 @@ class FftProto:
             all_bins[n_read:] = np.conj(bins_read[1:total - n_read + 1][::-1])
             return all_bins * scale, None
         return bins_read * scale, None
+
+    def bulk_read(self, n_bins, rescale=True, hermitian=False):
+        """Stream `n_bins` complex bins in ONE SPI transaction (BULK_READ 0x23).
+
+        Removes the per-frame overhead of the chunked read path: the FPGA keeps
+        emitting 4-byte bins (re_hi,re_lo,im_hi,im_lo) for as long as CS stays
+        asserted, starting from bin 0. The master simply clocks the exact byte
+        count it wants, then deasserts CS.
+
+        Returns true complex FFT values (rescaled by 2**bfp_exp when rescale).
+
+        Note: spidev's default transfer buffer is 4096 bytes. One transaction
+        carries 9 header bytes + n_bins*4 data bytes, so n_bins is capped near
+        ~1021 unless the spidev bufsiz module param is raised. Hermitian
+        (n_bins = N/2+1) stays well under the limit.
+        """
+        scale = 1.0
+        if rescale:
+            flags, err = self.status()
+            if not err:
+                scale = float(1 << flags['exp'])
+
+        n_read = (n_bins // 2 + 1) if hermitian else n_bins
+
+        seq  = self._next_seq()
+        csum = checksum(CMD_BULK_READ, 0, seq)
+        # header(4) + GAP(1) + TX header(4) = 9 bytes before the stream begins.
+        data_off = 9
+        mosi = bytes([CMD_BULK_READ, 0, seq, csum]) + b'\x00' * (data_off - 4 + n_read * 4)
+
+        miso = bytes(self.spi.xfer2(list(mosi)))
+        if len(miso) < data_off + n_read * 4:
+            return None, f"MISO too short: {len(miso)}, need {data_off + n_read * 4}"
+
+        payload = miso[data_off:data_off + n_read * 4]
+        bins = np.zeros(n_read, dtype=complex)
+        for i in range(n_read):
+            re = (payload[i * 4] << 8) | payload[i * 4 + 1]
+            im = (payload[i * 4 + 2] << 8) | payload[i * 4 + 3]
+            if re & 0x8000:
+                re -= 0x10000
+            if im & 0x8000:
+                im -= 0x10000
+            bins[i] = complex(re, im)
+
+        if hermitian:
+            all_bins = np.zeros(n_bins, dtype=complex)
+            all_bins[:n_read] = bins
+            all_bins[n_read:] = np.conj(bins[1:n_bins - n_read + 1][::-1])
+            return all_bins * scale, None
+        return bins * scale, None
 
     def wait_done(self, timeout=2.0, poll_ms=50):
         """Poll STATUS until done=1 or timeout."""
